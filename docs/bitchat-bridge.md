@@ -6,6 +6,7 @@ The Bitchat Bridge enables communication between the [Bitchat](https://bitchat.a
 
 - **Bridge Direction**: Bidirectional - messages flow both ways between Bitchat and MeshCore
 - **Channel**: Only the `#mesh` channel is bridged (hardcoded)
+- **MeshCore region**: Bridge transmissions use the persistent `bitchat_region` setting (default `slc`)
 - **Identification**: Messages from Bitchat users appear with a phone emoji prefix on MeshCore nodes
 - **Platforms**: ESP32 (full support) and NRF52 (limited - short messages only)
 
@@ -93,6 +94,16 @@ pio run -e Heltec_WSL3_companion_radio_usb_bitchat
 # Flash
 pio run -e Heltec_WSL3_companion_radio_usb_bitchat -t upload
 ```
+
+### MeshCore region scope
+
+Set the bridge's persistent region scope with the MeshCore CLI. The leading `#` is optional:
+
+```bash
+meshcli -s /dev/ttyACM0 set bitchat_region slc
+```
+
+The bridge uses this region for BitChat-to-MeshCore transmissions.
 
 
 ## Troubleshooting

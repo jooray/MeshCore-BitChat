@@ -1855,10 +1855,12 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_GET_CUSTOM_VARS) {
     out_frame[0] = RESP_CODE_CUSTOM_VARS;
     char *dp = (char *)&out_frame[1];
+    strcpy(dp, "bitchat_region:");
+    dp = strchr(dp, 0);
+    strcpy(dp, _prefs.bitchat_region);
+    dp = strchr(dp, 0);
     for (int i = 0; i < sensors.getNumSettings() && dp - (char *)&out_frame[1] < 140; i++) {
-      if (i > 0) {
-        *dp++ = ',';
-      }
+      *dp++ = ',';
       strcpy(dp, sensors.getSettingName(i));
       dp = strchr(dp, 0);
       *dp++ = ':';
@@ -1872,7 +1874,14 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
-      bool success = sensors.setSettingValue(sp, np);
+      bool success = false;
+      if (strcmp(sp, "bitchat_region") == 0 && strlen(np) < sizeof(_prefs.bitchat_region)) {
+        strcpy(_prefs.bitchat_region, np);
+        savePrefs();
+        success = true;
+      } else {
+        success = sensors.setSettingValue(sp, np);
+      }
       if (success) {
         #if ENV_INCLUDE_GPS == 1
         // Update node preferences for GPS settings

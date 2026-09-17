@@ -1,4 +1,5 @@
 #include "BitchatBridge.h"
+#include "../TransportKeyStore.h"
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -136,10 +137,12 @@ uint8_t* BitchatBridge::getDecompBuffer() {
 #endif
 }
 
-BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName)
+BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName,
+                             const char* regionName)
     : _mesh(mesh)
     , _identity(identity)
     , _nodeName(nodeName)
+    , _regionName(regionName)
     , _bitchatPeerId(0)
     , _channelConfigured(false)
     , _lastAnnounceTime(0)
@@ -1483,7 +1486,14 @@ void BitchatBridge::sendSingleMessageToMesh(const char* senderNick, const char* 
     // Create and send packet immediately (no delay - use pending parts queue for multi-part)
     mesh::Packet* pkt = _mesh.createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, targetChannel, payload, offset);
     if (pkt != nullptr) {
-        _mesh.sendFlood(pkt);  // Send immediately (no delay)
+        char regionName[32];
+        if (_regionName[0] == '#') snprintf(regionName, sizeof(regionName), "%s", _regionName);
+        else snprintf(regionName, sizeof(regionName), "#%s", _regionName);
+        TransportKey regionKey;
+        mesh::Utils::sha256(regionKey.key, sizeof(regionKey.key),
+                            reinterpret_cast<const uint8_t*>(regionName), strlen(regionName));
+        uint16_t transportCodes[2] = {regionKey.calcTransportCode(pkt), 0};
+        _mesh.sendFlood(pkt, transportCodes);
         _messagesRelayed++;
         BITCHAT_DEBUG_PRINTLN("Sent to mesh: %s: %s", prefixedSender, text);
     } else {
