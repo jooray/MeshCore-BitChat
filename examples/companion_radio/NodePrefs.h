@@ -51,6 +51,7 @@ public:
   uint8_t agc_reset_interval = 0;  // secs / 4
   char default_scope_name[31];
   uint8_t default_scope_key[16];
+  char bitchat_region[31];
   float tz_offset = 0;
   float adc_multiplier = 0;   // battery ADC multiplier, 0 = board default
 #ifdef ENABLE_WIFI_INTERFACE
@@ -96,7 +97,6 @@ public:
   uint8_t ui_gps_action = 0;
 #endif
 #endif
-
 private:
   class RadioPrefs : public CommonRadioPrefs {
     NodePrefs* _parent;
@@ -215,6 +215,7 @@ private:
       def("auto_max", _parent->autoadd_max_hops);  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
       def("defs_nm", _parent->default_scope_name, sizeof(_parent->default_scope_name));
       def("defs_key", (void *) _parent->default_scope_key, sizeof(_parent->default_scope_key));
+      def("bc_region", _parent->bitchat_region, sizeof(_parent->bitchat_region));
       def("pin", _parent->ble_pin);
       def("buzz_q", _parent->buzzer_quiet);
       def("vibe_q", _parent->vibe_quiet);
@@ -301,6 +302,7 @@ public:
     node_name[0] = 0;
     default_scope_name[0] = 0;
     memset(default_scope_key, 0, sizeof(default_scope_key));
+    bitchat_region[0] = 0;   // empty = unscoped, as before the setting existed
   }
   // new accessor methods
   bool isRepeatEn() const { return repeat.disable_fwd == 0; }
