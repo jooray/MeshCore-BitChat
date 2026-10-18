@@ -136,10 +136,12 @@ uint8_t* BitchatBridge::getDecompBuffer() {
 #endif
 }
 
-BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName)
+BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName,
+                             const uint8_t& pathHashMode)
     : _mesh(mesh)
     , _identity(identity)
     , _nodeName(nodeName)
+    , _pathHashMode(pathHashMode)
     , _bitchatPeerId(0)
     , _channelConfigured(false)
     , _lastAnnounceTime(0)
@@ -1483,7 +1485,8 @@ void BitchatBridge::sendSingleMessageToMesh(const char* senderNick, const char* 
     // Create and send packet immediately (no delay - use pending parts queue for multi-part)
     mesh::Packet* pkt = _mesh.createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, targetChannel, payload, offset);
     if (pkt != nullptr) {
-        _mesh.sendFlood(pkt);  // Send immediately (no delay)
+        const uint8_t pathHashSize = _pathHashMode + 1;
+        _mesh.sendFlood(pkt, uint32_t{0}, pathHashSize);
         _messagesRelayed++;
         BITCHAT_DEBUG_PRINTLN("Sent to mesh: %s: %s", prefixedSender, text);
     } else {

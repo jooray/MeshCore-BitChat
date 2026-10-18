@@ -272,7 +272,8 @@ void setup() {
 
 // add bitchat bridge, must be after the bluetooth interface has been started
 #if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
-  bitchat_bridge = new BitchatBridge(the_mesh, the_mesh.self_id, the_mesh.getNodeName());
+  bitchat_bridge = new BitchatBridge(the_mesh, the_mesh.self_id, the_mesh.getNodeName(),
+                                    the_mesh.getNodePrefs()->path_hash_mode);
   if (bitchat_bridge == nullptr) {
     Serial.println("ERROR: BitchatBridge allocation failed!");
   } else {
