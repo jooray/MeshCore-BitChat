@@ -38,6 +38,7 @@ public:
   uint8_t autoadd_max_hops = 0;  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
   char default_scope_name[31];
   uint8_t default_scope_key[16];
+  char bitchat_region[31];
 
 private:
   class RadioPrefs : public ConfigSerializer {  // COPIED from CommonCLI (for now)
@@ -100,6 +101,7 @@ private:
       def("auto_max", _parent->autoadd_max_hops);  // 0 = no limit, 1 = direct (0 hops), N = up to N-1 hops (max 64)
       def("defs_nm", _parent->default_scope_name, sizeof(_parent->default_scope_name));
       def("defs_key", (void *) _parent->default_scope_key, sizeof(_parent->default_scope_key));
+      def("bc_region", _parent->bitchat_region, sizeof(_parent->bitchat_region));
       def("pin", _parent->ble_pin);
       def("buzz_q", _parent->buzzer_quiet);
       def("vibe_q", _parent->vibe_quiet);
@@ -131,6 +133,7 @@ public:
     node_name[0] = 0;
     default_scope_name[0] = 0;
     memset(default_scope_key, 0, sizeof(default_scope_key));
+    strcpy(bitchat_region, "slc");
   }
   // new accessor methods
   bool isRepeatEn() const { return repeat.disable_fwd == 0; }
