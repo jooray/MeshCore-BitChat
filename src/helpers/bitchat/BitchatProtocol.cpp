@@ -1,4 +1,5 @@
 #include "BitchatProtocol.h"
+#include "BitchatDebugSerial.h"
 #include "BitchatBridge.h"  // For shared decompression buffers
 #include "../../Utils.h"
 
@@ -142,11 +143,11 @@ void BitchatProtocol::writeBE64(uint8_t* data, uint64_t value) {
 // ============================================================================
 
 bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMessage& msg) {
-    Serial.printf("REDUNDANT_DEBUG: parseMessage ENTRY len=%u\n", (unsigned)length);
-    Serial.flush();
+    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage ENTRY len=%u\n", (unsigned)length);
+    BITCHAT_SERIAL.flush();
 
     if (length < BITCHAT_HEADER_SIZE) {
-        Serial.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for header");
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for header");
         return false;
     }
 
@@ -163,7 +164,7 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
     uint32_t payloadLen;
     if (msg.version >= BITCHAT_VERSION_2) {
         if (length < BITCHAT_HEADER_SIZE_V2) {
-            Serial.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for v2 header");
+            BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for v2 header");
             return false;
         }
         payloadLen = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16)
@@ -176,19 +177,19 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
     // Our buffers index payload length as 16-bit; the bridge only handles small #mesh text,
     // so reject any (v2) payload that wouldn't fit rather than truncating silently.
     if (payloadLen > 0xFFFF) {
-        Serial.println("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen too large");
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen too large");
         return false;
     }
     msg.payloadLength = (uint16_t)payloadLen;
     msg.wirePayloadLength = msg.payloadLength;  // Store original wire length before decompression
 
-    Serial.printf("REDUNDANT_DEBUG: parseMessage HEADER: ver=%u type=0x%02X ttl=%u flags=0x%02X payloadLen=%u\n",
+    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage HEADER: ver=%u type=0x%02X ttl=%u flags=0x%02X payloadLen=%u\n",
                   msg.version, msg.type, msg.ttl, msg.flags, msg.payloadLength);
-    Serial.flush();
+    BITCHAT_SERIAL.flush();
 
     // Validate version (we can parse v1 and v2)
     if (msg.version < 1 || msg.version > BITCHAT_VERSION_MAX) {
-        Serial.printf("REDUNDANT_DEBUG: parseMessage FAIL - bad version %u (max %u)\n",
+        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage FAIL - bad version %u (max %u)\n",
                       msg.version, BITCHAT_VERSION_MAX);
         return false;
     }
@@ -201,7 +202,7 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
     const size_t MAX_COMPRESSED_WIRE_PAYLOAD = 2048;  // Max compressed payload on wire
     size_t maxPayload = isCompressed ? MAX_COMPRESSED_WIRE_PAYLOAD : BITCHAT_MAX_PAYLOAD_SIZE;
     if (msg.payloadLength > maxPayload) {
-        Serial.printf("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen %u > max %u\n",
+        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen %u > max %u\n",
                       msg.payloadLength, (unsigned)maxPayload);
         return false;
     }
@@ -218,11 +219,11 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
         expectedSize += BITCHAT_SIGNATURE_SIZE;
     }
 
-    Serial.printf("REDUNDANT_DEBUG: parseMessage expectedSize=%u, have=%u\n",
+    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage expectedSize=%u, have=%u\n",
                   (unsigned)expectedSize, (unsigned)length);
 
     if (length < expectedSize) {
-        Serial.println("REDUNDANT_DEBUG: parseMessage FAIL - not enough data");
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - not enough data");
         return false;
     }
 
@@ -262,14 +263,14 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
                                msg.type == BITCHAT_MSG_FRAGMENT_NEW);
         if (msg.isCompressed() && !isFragmentType) {
 #if BITCHAT_HAS_DECOMPRESSION
-            Serial.println("PARSE: Compressed payload detected");
-            Serial.flush();
+            BITCHAT_SERIAL.println("PARSE: Compressed payload detected");
+            BITCHAT_SERIAL.flush();
 
             // Compressed payload format (from Android CompressionUtil.kt):
             // - First 2 bytes: original uncompressed size (big-endian)
             // - Remaining bytes: raw deflate compressed data
             if (wirePayloadLength < 3) {
-                Serial.println("PARSE: Compressed payload too short");
+                BITCHAT_SERIAL.println("PARSE: Compressed payload too short");
                 return false;
             }
 
@@ -278,30 +279,30 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
             const uint8_t* compressedData = &data[offset + 2];
             size_t compressedLen = wirePayloadLength - 2;
 
-            Serial.printf("PARSE: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
-            Serial.flush();
+            BITCHAT_SERIAL.printf("PARSE: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
+            BITCHAT_SERIAL.flush();
 
             if (originalSize > BITCHAT_MAX_PAYLOAD_SIZE) {
-                Serial.printf("PARSE: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
+                BITCHAT_SERIAL.printf("PARSE: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
                 return false;
             }
 
             // ESP32: Use malloc for decompression buffers (has plenty of heap and ROM miniz)
-            Serial.printf("PARSE: malloc decompressor (%u bytes)...\n", (unsigned)sizeof(tinfl_decompressor));
-            Serial.flush();
+            BITCHAT_SERIAL.printf("PARSE: malloc decompressor (%u bytes)...\n", (unsigned)sizeof(tinfl_decompressor));
+            BITCHAT_SERIAL.flush();
             tinfl_decompressor* decomp = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
-            Serial.printf("PARSE: malloc buffer (%u bytes)...\n", BITCHAT_MAX_PAYLOAD_SIZE);
-            Serial.flush();
+            BITCHAT_SERIAL.printf("PARSE: malloc buffer (%u bytes)...\n", BITCHAT_MAX_PAYLOAD_SIZE);
+            BITCHAT_SERIAL.flush();
             uint8_t* decompBuffer = (uint8_t*)malloc(BITCHAT_MAX_PAYLOAD_SIZE);
 
             if (decomp == nullptr || decompBuffer == nullptr) {
-                Serial.println("PARSE: malloc failed!");
+                BITCHAT_SERIAL.println("PARSE: malloc failed!");
                 if (decomp) free(decomp);
                 if (decompBuffer) free(decompBuffer);
                 return false;
             }
-            Serial.println("PARSE: malloc OK, initializing decompressor...");
-            Serial.flush();
+            BITCHAT_SERIAL.println("PARSE: malloc OK, initializing decompressor...");
+            BITCHAT_SERIAL.flush();
 
             tinfl_init(decomp);
 
@@ -313,8 +314,8 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
             const int linearBufFlag = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
 
             // Try raw deflate first (Android uses raw deflate, not zlib)
-            Serial.println("PARSE: Calling tinfl_decompress (raw deflate)...");
-            Serial.flush();
+            BITCHAT_SERIAL.println("PARSE: Calling tinfl_decompress (raw deflate)...");
+            BITCHAT_SERIAL.flush();
             tinfl_status status = tinfl_decompress(
                 decomp,
                 compressedData,         // Input
@@ -324,13 +325,13 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
                 &outBytes,              // Output size (updated)
                 linearBufFlag           // Linear buffer, raw deflate
             );
-            Serial.printf("PARSE: tinfl_decompress returned status=%d, outBytes=%u\n", status, (unsigned)outBytes);
-            Serial.flush();
+            BITCHAT_SERIAL.printf("PARSE: tinfl_decompress returned status=%d, outBytes=%u\n", status, (unsigned)outBytes);
+            BITCHAT_SERIAL.flush();
 
             // If raw deflate failed, try with zlib header
             if (status != TINFL_STATUS_DONE) {
-                Serial.println("PARSE: Raw deflate failed, trying zlib...");
-                Serial.flush();
+                BITCHAT_SERIAL.println("PARSE: Raw deflate failed, trying zlib...");
+                BITCHAT_SERIAL.flush();
                 tinfl_init(decomp);
                 inBytes = compressedLen;
                 outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
@@ -343,24 +344,24 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
                     &outBytes,
                     linearBufFlag | TINFL_FLAG_PARSE_ZLIB_HEADER
                 );
-                Serial.printf("PARSE: zlib attempt returned status=%d\n", status);
-                Serial.flush();
+                BITCHAT_SERIAL.printf("PARSE: zlib attempt returned status=%d\n", status);
+                BITCHAT_SERIAL.flush();
             }
 
             if (status != TINFL_STATUS_DONE) {
-                Serial.printf("PARSE: Decompression failed with status=%d (expected %d)\n",
+                BITCHAT_SERIAL.printf("PARSE: Decompression failed with status=%d (expected %d)\n",
                               status, TINFL_STATUS_DONE);
-                Serial.flush();
+                BITCHAT_SERIAL.flush();
                 free(decomp);
                 free(decompBuffer);
                 return false;
             }
-            Serial.printf("PARSE: Decompression SUCCESS, outBytes=%u\n", (unsigned)outBytes);
-            Serial.flush();
+            BITCHAT_SERIAL.printf("PARSE: Decompression SUCCESS, outBytes=%u\n", (unsigned)outBytes);
+            BITCHAT_SERIAL.flush();
 
             // Bounds check: ensure decompressed data fits in payload buffer
             if (outBytes > BITCHAT_MAX_PAYLOAD_SIZE) {
-                Serial.printf("ERROR: Decompressed size %u exceeds buffer %u!\n",
+                BITCHAT_SERIAL.printf("ERROR: Decompressed size %u exceeds buffer %u!\n",
                               (unsigned)outBytes, (unsigned)BITCHAT_MAX_PAYLOAD_SIZE);
                 free(decomp);
                 free(decompBuffer);
@@ -393,9 +394,9 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
         offset += BITCHAT_SIGNATURE_SIZE;
     }
 
-    Serial.printf("REDUNDANT_DEBUG: parseMessage SUCCESS type=0x%02X payloadLen=%u\n",
+    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage SUCCESS type=0x%02X payloadLen=%u\n",
                   msg.type, msg.payloadLength);
-    Serial.flush();
+    BITCHAT_SERIAL.flush();
     return true;
 }
 
@@ -450,11 +451,11 @@ size_t BitchatProtocol::serializeMessage(const BitchatMessage& msg, uint8_t* buf
 }
 
 bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
-    Serial.printf("REDUNDANT_DEBUG: validateMessage type=0x%02X\n", msg.type);
+    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage type=0x%02X\n", msg.type);
 
     // Check version
     if (msg.version != BITCHAT_VERSION) {
-        Serial.printf("REDUNDANT_DEBUG: validateMessage FAIL - bad version %u\n", msg.version);
+        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - bad version %u\n", msg.version);
         return false;
     }
 
@@ -475,13 +476,13 @@ bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
         case BITCHAT_MSG_FRAGMENT:
             break;
         default:
-            Serial.printf("REDUNDANT_DEBUG: validateMessage FAIL - unknown type 0x%02X\n", msg.type);
+            BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - unknown type 0x%02X\n", msg.type);
             return false;
     }
 
     // Check payload length
     if (msg.payloadLength > BITCHAT_MAX_PAYLOAD_SIZE) {
-        Serial.printf("REDUNDANT_DEBUG: validateMessage FAIL - payloadLen %u > max\n", msg.payloadLength);
+        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - payloadLen %u > max\n", msg.payloadLength);
         return false;
     }
 
@@ -494,11 +495,11 @@ bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
         }
     }
     if (!senderNonZero) {
-        Serial.println("REDUNDANT_DEBUG: validateMessage FAIL - zero sender ID");
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: validateMessage FAIL - zero sender ID");
         return false;
     }
 
-    Serial.println("REDUNDANT_DEBUG: validateMessage SUCCESS");
+    BITCHAT_SERIAL.println("REDUNDANT_DEBUG: validateMessage SUCCESS");
     return true;
 }
 
@@ -687,14 +688,14 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     }
 
 #if BITCHAT_HAS_DECOMPRESSION
-    Serial.println("DECOMPRESS: Compressed payload detected");
-    Serial.flush();
+    BITCHAT_SERIAL.println("DECOMPRESS: Compressed payload detected");
+    BITCHAT_SERIAL.flush();
 
     // Compressed payload format (from Android CompressionUtil.kt):
     // - First 2 bytes: original uncompressed size (big-endian)
     // - Remaining bytes: raw deflate compressed data
     if (msg.payloadLength < 3) {
-        Serial.println("DECOMPRESS: Payload too short");
+        BITCHAT_SERIAL.println("DECOMPRESS: Payload too short");
         return false;
     }
 
@@ -703,11 +704,11 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     const uint8_t* compressedData = &msg.payload[2];
     size_t compressedLen = msg.payloadLength - 2;
 
-    Serial.printf("DECOMPRESS: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
-    Serial.flush();
+    BITCHAT_SERIAL.printf("DECOMPRESS: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
+    BITCHAT_SERIAL.flush();
 
     if (originalSize > BITCHAT_MAX_PAYLOAD_SIZE) {
-        Serial.printf("DECOMPRESS: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
+        BITCHAT_SERIAL.printf("DECOMPRESS: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
         return false;
     }
 
@@ -717,7 +718,7 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     uint8_t* decompBuffer = BitchatBridge::getDecompBuffer();
 
     if (decomp == nullptr || decompBuffer == nullptr) {
-        Serial.println("DECOMPRESS: Static buffers not available!");
+        BITCHAT_SERIAL.println("DECOMPRESS: Static buffers not available!");
         return false;
     }
 #else
@@ -726,7 +727,7 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     uint8_t* decompBuffer = (uint8_t*)malloc(BITCHAT_MAX_PAYLOAD_SIZE);
 
     if (decomp == nullptr || decompBuffer == nullptr) {
-        Serial.println("DECOMPRESS: malloc failed!");
+        BITCHAT_SERIAL.println("DECOMPRESS: malloc failed!");
         if (decomp) free(decomp);
         if (decompBuffer) free(decompBuffer);
         return false;
@@ -742,8 +743,8 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     const int linearBufFlag = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
 
     // Try raw deflate first (Android uses raw deflate, not zlib)
-    Serial.println("DECOMPRESS: Trying raw deflate...");
-    Serial.flush();
+    BITCHAT_SERIAL.println("DECOMPRESS: Trying raw deflate...");
+    BITCHAT_SERIAL.flush();
     tinfl_status status = tinfl_decompress(
         decomp,
         compressedData,
@@ -756,8 +757,8 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
 
     // If raw deflate failed, try with zlib header
     if (status != TINFL_STATUS_DONE) {
-        Serial.println("DECOMPRESS: Raw deflate failed, trying zlib...");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DECOMPRESS: Raw deflate failed, trying zlib...");
+        BITCHAT_SERIAL.flush();
         tinfl_init(decomp);
         inBytes = compressedLen;
         outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
@@ -773,7 +774,7 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
     }
 
     if (status != TINFL_STATUS_DONE) {
-        Serial.println("DECOMPRESS: Decompression failed");
+        BITCHAT_SERIAL.println("DECOMPRESS: Decompression failed");
 #if !defined(NRF52_PLATFORM)
         free(decomp);
         free(decompBuffer);
@@ -781,12 +782,12 @@ bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
         return false;
     }
 
-    Serial.printf("DECOMPRESS: Success, outBytes=%u\n", (unsigned)outBytes);
-    Serial.flush();
+    BITCHAT_SERIAL.printf("DECOMPRESS: Success, outBytes=%u\n", (unsigned)outBytes);
+    BITCHAT_SERIAL.flush();
 
     // Bounds check
     if (outBytes > BITCHAT_MAX_PAYLOAD_SIZE) {
-        Serial.printf("DECOMPRESS: Decompressed size %u exceeds buffer!\n", (unsigned)outBytes);
+        BITCHAT_SERIAL.printf("DECOMPRESS: Decompressed size %u exceeds buffer!\n", (unsigned)outBytes);
 #if !defined(NRF52_PLATFORM)
         free(decomp);
         free(decompBuffer);

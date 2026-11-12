@@ -1,6 +1,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#include <helpers/bitchat/BitchatDebugSerial.h>  // BITCHAT_SERIAL: silent unless BITCHAT_DEBUG_SERIAL=1
 
 #if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
 extern "C" void print_stack_usage(void);
@@ -161,8 +162,8 @@ static void loopDuringDisplayRefresh();
 void setup() {
   Serial.begin(115200);
 
-  // Early debug - wait for USB serial on NRF52
-  #if defined(NRF52_PLATFORM)
+  // Debug builds only (-D BITCHAT_DEBUG_SERIAL=1): wait for the USB serial console on NRF52
+  #if defined(NRF52_PLATFORM) && BITCHAT_DEBUG_SERIAL_ENABLED
   // Wait for USB serial to be ready (with timeout)
   uint32_t serialWaitStart = millis();
   while (!Serial && (millis() - serialWaitStart < 3000)) {
@@ -170,12 +171,12 @@ void setup() {
   }
   // Serial port ready - skip boot wait since crashes happen much later
   #endif
-  Serial.println("\n\n=== BOOT START ===");
-  Serial.flush();
+  BITCHAT_SERIAL.println("\n\n=== BOOT START ===");
+  BITCHAT_SERIAL.flush();
 
   board.begin();
-  Serial.println("board.begin() done");
-  Serial.flush();
+  BITCHAT_SERIAL.println("board.begin() done");
+  BITCHAT_SERIAL.flush();
 
 #if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
   // Paint ISR stack with canary pattern for high-water marking
@@ -186,8 +187,8 @@ void setup() {
   for (uint32_t i = 0; i < isr_stack_words; i++) {
       isr_stack_ptr[i] = 0xa5a5a5a5;  // FreeRTOS canary pattern
   }
-  Serial.println("ISR stack painted with canary pattern");
-  Serial.flush();
+  BITCHAT_SERIAL.println("ISR stack painted with canary pattern");
+  BITCHAT_SERIAL.flush();
 #endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
@@ -363,7 +364,7 @@ void setup() {
   bitchat_bridge = new BitchatBridge(the_mesh, the_mesh.self_id, the_mesh.getNodeName(),
                                     the_mesh.getNodePrefs()->path_hash_mode);
   if (bitchat_bridge == nullptr) {
-    Serial.println("ERROR: BitchatBridge allocation failed!");
+    BITCHAT_SERIAL.println("ERROR: BitchatBridge allocation failed!");
   } else {
     bitchat_bridge->begin();
   #if defined(BLE_PIN_CODE) && defined(ESP32)
@@ -371,16 +372,16 @@ void setup() {
     if (bluetooth_interface.getBLEServer() != nullptr
           && bitchat_bridge->attachBLEService(bluetooth_interface.getBLEServer())) {
       bluetooth_interface.setBitchatService(&bitchat_bridge->getBLEService());
-      Serial.println("Bitchat BLE service attached");
+      BITCHAT_SERIAL.println("Bitchat BLE service attached");
     } else {
-      Serial.println("ERROR: Failed to attach Bitchat BLE service!");
+      BITCHAT_SERIAL.println("ERROR: Failed to attach Bitchat BLE service!");
     }
   #else
     // no companion BLE interface, Bitchat owns the BLE stack
     if (bitchat_bridge->beginStandalone(the_mesh.getNodeName())) {
-      Serial.println("Bitchat BLE service started (standalone mode)");
+      BITCHAT_SERIAL.println("Bitchat BLE service started (standalone mode)");
     } else {
-      Serial.println("ERROR: Failed to start Bitchat BLE service!");
+      BITCHAT_SERIAL.println("ERROR: Failed to start Bitchat BLE service!");
     }
   #endif
     the_mesh.initBitchat(bitchat_bridge);
@@ -448,7 +449,7 @@ void loop() {
 #endif
   }
 
-#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT) && BITCHAT_DEBUG_SERIAL_ENABLED  // stack diagnostics, debug builds only
   // Print stack usage every 10 seconds for diagnostics
   static uint32_t last_stack_print = 0;
   if (millis() - last_stack_print >= 10000) {

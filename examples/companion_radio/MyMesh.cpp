@@ -12,6 +12,7 @@
 
 #if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
 #include <helpers/bitchat/BitchatBridge.h>
+#include <helpers/bitchat/BitchatDebugSerial.h>
 #endif
 
 #define CMD_APP_START                 1
@@ -576,9 +577,9 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
 #if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
-  Serial.println("MYMESH: onChannelMessageRecv called");
-  Serial.print("MYMESH: _bitchatBridge=");
-  Serial.println(_bitchatBridge != nullptr ? "valid" : "NULL");
+  BITCHAT_SERIAL.println("MYMESH: onChannelMessageRecv called");
+  BITCHAT_SERIAL.print("MYMESH: _bitchatBridge=");
+  BITCHAT_SERIAL.println(_bitchatBridge != nullptr ? "valid" : "NULL");
 
   // Forward to Bitchat bridge if available
   if (_bitchatBridge != nullptr) {
@@ -599,7 +600,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
       // No colon found, use whole text
       _bitchatBridge->onMeshcoreGroupMessage(channel, timestamp, "Unknown", text);
     }
-    Serial.println("MYMESH: bitchat bridge call returned");
+    BITCHAT_SERIAL.println("MYMESH: bitchat bridge call returned");
   }
 #endif
 
@@ -642,7 +643,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     _listener->onChannelMessageRecv(pkt, channel_details, text);
     _listener->onQueueSizeChanged(offline_queue_len);
   }
-  Serial.println("MYMESH: onChannelMessageRecv COMPLETE");
+  BITCHAT_SERIAL.println("MYMESH: onChannelMessageRecv COMPLETE");
 }
 
 void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint16_t data_type,

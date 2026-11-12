@@ -162,6 +162,16 @@ On the other hand, the bitchat repeater should be where people are (Bluetooth ne
 
 ## Debugging
 
+### Serial output is off by default
+
+The USB companion protocol shares the USB Serial port, so any diagnostic text
+written there corrupts the companion stream. By default the Bitchat bridge
+(including the boot trace, the nRF52 stack usage report every 10 s and the
+hardfault dump) writes nothing to Serial. To enable all of it for a debugging
+session, build with `-D BITCHAT_DEBUG_SERIAL=1` and open a plain serial
+console. Do not use such a build with a companion app over USB.
+`BITCHAT_DEBUG=1` and `BITCHAT_DEBUG_PACKETDUMP=1` (below) imply it.
+
 To enable debug output, use one of these methods:
 
 ### Method 1: Environment variable (temporary)

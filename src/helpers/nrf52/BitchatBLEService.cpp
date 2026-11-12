@@ -1,4 +1,5 @@
 #include "BitchatBLEService.h"
+#include "../bitchat/BitchatDebugSerial.h"
 
 #ifdef NRF52_PLATFORM
 
@@ -6,7 +7,7 @@
 
 // Debug output - Adafruit nRF52 core supports Serial.printf
 #if BITCHAT_DEBUG
-  #define BITCHAT_DEBUG_PRINTLN(...) do { Serial.printf("BITCHAT_BLE: "); Serial.printf(__VA_ARGS__); Serial.println(); } while(0)
+  #define BITCHAT_DEBUG_PRINTLN(...) do { BITCHAT_SERIAL.printf("BITCHAT_BLE: "); BITCHAT_SERIAL.printf(__VA_ARGS__); BITCHAT_SERIAL.println(); } while(0)
 #else
   #define BITCHAT_DEBUG_PRINTLN(...) {}
 #endif
@@ -64,11 +65,11 @@ BitchatBLEService::BitchatBLEService()
 }
 
 bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallback* callback) {
-    Serial.println("NRF52_BLE: beginStandalone entry");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: beginStandalone entry");
+    BITCHAT_SERIAL.flush();
 
     if (callback == nullptr) {
-        Serial.println("NRF52_BLE: ERROR - callback is nullptr");
+        BITCHAT_SERIAL.println("NRF52_BLE: ERROR - callback is nullptr");
         return false;
     }
 
@@ -76,8 +77,8 @@ bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallba
     strncpy(_deviceName, deviceName, sizeof(_deviceName) - 1);
     _deviceName[sizeof(_deviceName) - 1] = '\0';
 
-    Serial.println("NRF52_BLE: Configuring connection params");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Configuring connection params");
+    BITCHAT_SERIAL.flush();
 
     // Configure connection parameters BEFORE begin()
     // MTU 517 is standard max BLE MTU - allows writes up to 514 bytes
@@ -85,14 +86,14 @@ bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallba
     // Parameters: mtu_max, event_len, hvn_qsize, wrcmd_qsize
     Bluefruit.configPrphConn(517, BLE_GAP_EVENT_LENGTH_DEFAULT, BLE_GATTS_HVN_TX_QUEUE_SIZE_DEFAULT, BLE_GATTC_WRITE_CMD_TX_QUEUE_SIZE_DEFAULT);
 
-    Serial.println("NRF52_BLE: Calling Bluefruit.begin()");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Calling Bluefruit.begin()");
+    BITCHAT_SERIAL.flush();
 
     // Initialize Bluefruit
     Bluefruit.begin();
 
-    Serial.println("NRF52_BLE: Bluefruit.begin() returned");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Bluefruit.begin() returned");
+    BITCHAT_SERIAL.flush();
 
     Bluefruit.setTxPower(8);  // Max power (+8 dBm) for better range
 
@@ -104,8 +105,8 @@ bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallba
     Bluefruit.Security.setMITM(false);
     Bluefruit.Security.setIOCaps(false, false, false);
 
-    Serial.println("NRF52_BLE: Setting device name");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Setting device name");
+    BITCHAT_SERIAL.flush();
 
     // Set device name (filter out non-ASCII characters for BLE)
     char safeName[32];
@@ -120,14 +121,14 @@ bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallba
 
     Bluefruit.setName(safeName);
 
-    Serial.println("NRF52_BLE: Starting service");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Starting service");
+    BITCHAT_SERIAL.flush();
 
     // Configure the Bitchat service
     _service.begin();
 
-    Serial.println("NRF52_BLE: Configuring characteristic");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Configuring characteristic");
+    BITCHAT_SERIAL.flush();
 
     // Configure the characteristic with READ, WRITE, WRITE_NR, NOTIFY properties
     _characteristic.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP | CHR_PROPS_NOTIFY | CHR_PROPS_INDICATE);
@@ -138,8 +139,8 @@ bool BitchatBLEService::beginStandalone(const char* deviceName, BitchatBLECallba
     _characteristic.setCccdWriteCallback(onCharacteristicCccdWrite);
     _characteristic.begin();
 
-    Serial.println("NRF52_BLE: Service fully initialized");
-    Serial.flush();
+    BITCHAT_SERIAL.println("NRF52_BLE: Service fully initialized");
+    BITCHAT_SERIAL.flush();
 
     _serviceActive = true;
     BITCHAT_DEBUG_PRINTLN("Bitchat BLE service initialized: %s", safeName);
@@ -209,9 +210,9 @@ void BitchatBLEService::processQueue() {
             _messageQueue[_queueHead].valid = false;
 
             if (_callback != nullptr) {
-                Serial.println("BLE_SERVICE: processQueue() calling callback...");
+                BITCHAT_SERIAL.println("BLE_SERVICE: processQueue() calling callback...");
                 _callback->onBitchatMessageReceived(_messageQueue[_queueHead].msg);
-                Serial.println("BLE_SERVICE: processQueue() callback returned");
+                BITCHAT_SERIAL.println("BLE_SERVICE: processQueue() callback returned");
             }
         }
         _queueHead = (_queueHead + 1) % MESSAGE_QUEUE_SIZE;
@@ -227,17 +228,17 @@ void BitchatBLEService::loop() {
         _pendingConnect = false;
         justConnected = true;
         if (_callback != nullptr) {
-            Serial.println("DEBUG_CRASH: Before callback->onBitchatClientConnect");
-            Serial.flush();
+            BITCHAT_SERIAL.println("DEBUG_CRASH: Before callback->onBitchatClientConnect");
+            BITCHAT_SERIAL.flush();
             _callback->onBitchatClientConnect();
-            Serial.println("DEBUG_CRASH: After callback->onBitchatClientConnect");
-            Serial.flush();
+            BITCHAT_SERIAL.println("DEBUG_CRASH: After callback->onBitchatClientConnect");
+            BITCHAT_SERIAL.flush();
         }
     }
 
     if (justConnected) {
-        Serial.println("DEBUG_CRASH: BLE loop after connect - checkpoint 1");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BLE loop after connect - checkpoint 1");
+        BITCHAT_SERIAL.flush();
     }
 
     // Handle deferred data processing
@@ -250,31 +251,31 @@ void BitchatBLEService::loop() {
         if (_writeBufferOffset >= 14) {
             uint8_t type = _writeBuffer[1];
             BITCHAT_DEBUG_PRINTLN("Message type=0x%02X", type);
-            Serial.flush();
+            BITCHAT_SERIAL.flush();
         }
 
         BitchatMessage msg;
-        Serial.println("BLE_LOOP: Calling parseMessage...");
-        Serial.flush();
+        BITCHAT_SERIAL.println("BLE_LOOP: Calling parseMessage...");
+        BITCHAT_SERIAL.flush();
         bool parseOk = BitchatProtocol::parseMessage(_writeBuffer, _writeBufferOffset, msg);
-        Serial.printf("BLE_LOOP: parseMessage returned %d\n", parseOk);
-        Serial.flush();
+        BITCHAT_SERIAL.printf("BLE_LOOP: parseMessage returned %d\n", parseOk);
+        BITCHAT_SERIAL.flush();
 
         if (parseOk) {
             if (BitchatProtocol::validateMessage(msg)) {
-                Serial.printf("BLE_LOOP: Valid msg type=0x%02X, len=%d\n", msg.type, msg.payloadLength);
-                Serial.flush();
+                BITCHAT_SERIAL.printf("BLE_LOOP: Valid msg type=0x%02X, len=%d\n", msg.type, msg.payloadLength);
+                BITCHAT_SERIAL.flush();
                 queueMessage(msg);
             } else {
-                Serial.println("BLE_LOOP: Validation failed");
+                BITCHAT_SERIAL.println("BLE_LOOP: Validation failed");
             }
             clearWriteBuffer();
         } else {
-            Serial.printf("BLE_LOOP: Parse failed, have %u bytes\n", (unsigned)_writeBufferOffset);
+            BITCHAT_SERIAL.printf("BLE_LOOP: Parse failed, have %u bytes\n", (unsigned)_writeBufferOffset);
             if (_writeBufferOffset >= BITCHAT_HEADER_SIZE) {
                 size_t expectedMin = BitchatProtocol::getMessageSize(msg);
                 if (_writeBufferOffset > expectedMin + 100) {
-                    Serial.println("BLE_LOOP: Clearing unparseable data");
+                    BITCHAT_SERIAL.println("BLE_LOOP: Clearing unparseable data");
                     clearWriteBuffer();
                 }
             }
@@ -282,8 +283,8 @@ void BitchatBLEService::loop() {
     }
 
     if (justConnected) {
-        Serial.println("DEBUG_CRASH: BLE loop after connect - checkpoint 2");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BLE loop after connect - checkpoint 2");
+        BITCHAT_SERIAL.flush();
     }
 
     // Check for write buffer timeout
@@ -295,8 +296,8 @@ void BitchatBLEService::loop() {
     }
 
     if (justConnected) {
-        Serial.println("DEBUG_CRASH: BLE loop after connect - checkpoint 3 (before processQueue)");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BLE loop after connect - checkpoint 3 (before processQueue)");
+        BITCHAT_SERIAL.flush();
     }
 
     // Process queued messages
@@ -310,7 +311,7 @@ void BitchatBLEService::loop() {
 }
 
 bool BitchatBLEService::broadcastMessage(const BitchatMessage& msg) {
-    Serial.println("BLE_SERVICE: >>> broadcastMessage() ENTRY <<<");
+    BITCHAT_SERIAL.println("BLE_SERVICE: >>> broadcastMessage() ENTRY <<<");
     BITCHAT_DEBUG_PRINTLN("broadcastMessage: type=0x%02X, active=%d, subscribed=%d, clients=%d",
                           msg.type, _serviceActive, _clientSubscribed, _bitchatClientCount);
 
@@ -341,16 +342,16 @@ bool BitchatBLEService::broadcastMessage(const BitchatMessage& msg) {
 
     // Try to send via notify if we have subscribers
     if (_clientSubscribed) {
-        Serial.println("BLE_SERVICE: Client subscribed, sending notify");
+        BITCHAT_SERIAL.println("BLE_SERVICE: Client subscribed, sending notify");
         uint16_t result = _characteristic.notify(buffer, len);
         BITCHAT_DEBUG_PRINTLN("broadcastMessage: notify returned %u", result);
         if (result) {
             BITCHAT_DEBUG_PRINTLN("TX: type=0x%02X, len=%u", msg.type, (unsigned)len);
         } else {
-            Serial.println("BLE_SERVICE: WARNING - notify returned 0 (failed)");
+            BITCHAT_SERIAL.println("BLE_SERVICE: WARNING - notify returned 0 (failed)");
         }
     } else {
-        Serial.println("BLE_SERVICE: Client NOT subscribed, only set characteristic value");
+        BITCHAT_SERIAL.println("BLE_SERVICE: Client NOT subscribed, only set characteristic value");
     }
 
     return true;
@@ -422,8 +423,8 @@ void BitchatBLEService::onCharacteristicWrite(uint16_t conn_handle, BLECharacter
 }
 
 void BitchatBLEService::onCharacteristicCccdWrite(uint16_t conn_handle, BLECharacteristic* chr, uint16_t cccd_value) {
-    Serial.print("BLE_SERVICE: CCCD write callback, cccd_value=0x");
-    Serial.println(cccd_value, HEX);
+    BITCHAT_SERIAL.print("BLE_SERVICE: CCCD write callback, cccd_value=0x");
+    BITCHAT_SERIAL.println(cccd_value, HEX);
 
     if (_instance != nullptr) {
         bool wasSubscribed = _instance->_clientSubscribed;
@@ -431,12 +432,12 @@ void BitchatBLEService::onCharacteristicCccdWrite(uint16_t conn_handle, BLEChara
         BITCHAT_DEBUG_PRINTLN("CCCD write: notifications %s (was %s)",
                               _instance->_clientSubscribed ? "enabled" : "disabled",
                               wasSubscribed ? "enabled" : "disabled");
-        Serial.print("BLE_SERVICE: _clientSubscribed now = ");
-        Serial.println(_instance->_clientSubscribed ? "true" : "false");
+        BITCHAT_SERIAL.print("BLE_SERVICE: _clientSubscribed now = ");
+        BITCHAT_SERIAL.println(_instance->_clientSubscribed ? "true" : "false");
 
         // If client just subscribed and we have pending messages, send them
         if (!wasSubscribed && _instance->_clientSubscribed) {
-            Serial.println("BLE_SERVICE: Client just subscribed, sending pending");
+            BITCHAT_SERIAL.println("BLE_SERVICE: Client just subscribed, sending pending");
             _instance->sendPendingOutgoing();
         }
     }
