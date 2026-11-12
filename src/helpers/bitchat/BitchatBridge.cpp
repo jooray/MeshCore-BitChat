@@ -1,5 +1,6 @@
 #include "BitchatBridge.h"
 #include "BitchatDebugSerial.h"
+#include "BitchatTextSplit.h"
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -86,15 +87,17 @@ static uint8_t g_reassembledData[2048];      // For fragment data
 static char g_senderNick[64];                // For message parsing
 static char g_messageContent[2048];          // For message content
 static char g_channelName[32];               // For channel name
-static char g_meshTxContent[200];            // For mesh→bitchat relay
 
-// Outbound (MeshCore -> Bitchat) pacing queue, see BitchatBridge.h "Outbound pacing"
+// Outbound (MeshCore -> Bitchat) pacing queue, see BitchatBridge.h "Outbound pacing".
+// One slot holds one chunk of at most BITCHAT_MAX_PUBLIC_PAYLOAD bytes (BitchatTextSplit.h).
 #if defined(NRF52_PLATFORM)
-  #define BITCHAT_TX_QUEUE_SIZE 6
+  #define BITCHAT_TX_QUEUE_BYTES 1200
 #else
-  #define BITCHAT_TX_QUEUE_SIZE 16
+  #define BITCHAT_TX_QUEUE_BYTES 3200
 #endif
-static char g_txQueue[BITCHAT_TX_QUEUE_SIZE][sizeof(g_meshTxContent)];
+#define BITCHAT_TX_SLOT_SIZE (BITCHAT_MAX_PUBLIC_PAYLOAD + 1)
+#define BITCHAT_TX_QUEUE_SIZE ((BITCHAT_TX_QUEUE_BYTES / BITCHAT_TX_SLOT_SIZE) < 4 ? 4 : (BITCHAT_TX_QUEUE_BYTES / BITCHAT_TX_SLOT_SIZE))
+static char g_txQueue[BITCHAT_TX_QUEUE_SIZE][BITCHAT_TX_SLOT_SIZE];
 static size_t g_txQueueHead = 0;   // oldest entry
 static size_t g_txQueueCount = 0;
 
@@ -1997,13 +2000,9 @@ void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, ui
         }
     }
 
-    // Build simple message content: "<senderName> text"
-    // Bitchat displays MESSAGE payload as plain text
-    // Use global buffer to avoid stack overflow on NRF52
-    snprintf(g_meshTxContent, sizeof(g_meshTxContent), "<%s> %s", senderName, text);
-
-    // Paced: bitchat-android hides a sender's messages beyond its rate budget
-    enqueueBitchatOutbound(g_meshTxContent);
+    // Bitchat shows the MESSAGE payload as plain text: "<senderName> text", split into
+    // chunks iOS can verify, and paced because the apps hide a sender beyond its rate budget
+    enqueueBitchatOutbound(senderName, text);
     BITCHAT_SERIAL.println("BITCHAT_BRIDGE: <<< onMeshcoreGroupMessage() EXIT <<<");
 #endif
 }
@@ -2083,18 +2082,24 @@ size_t BitchatBridge::countLinks(const char* text) {
     return links;
 }
 
-void BitchatBridge::enqueueBitchatOutbound(const char* text) {
-    if (g_txQueueCount >= BITCHAT_TX_QUEUE_SIZE) {
+void BitchatBridge::enqueueBitchatOutbound(const char* senderName, const char* text) {
+    BitchatTextSplitter splitter(senderName, text, BITCHAT_MAX_PUBLIC_PAYLOAD);
+    size_t chunks = splitter.count();
+    // All chunks or none: a message missing its middle is worse than a dropped one
+    if (chunks > BITCHAT_TX_QUEUE_SIZE - g_txQueueCount) {
         _txDropped++;
-        BITCHAT_DEBUG_PRINTLN("TX queue full (%u), dropping MeshCore message (dropped=%u)",
-                              (unsigned)BITCHAT_TX_QUEUE_SIZE, (unsigned)_txDropped);
+        BITCHAT_DEBUG_PRINTLN("TX queue full (%u/%u), dropping MeshCore message of %u chunks (dropped=%u)",
+                              (unsigned)g_txQueueCount, (unsigned)BITCHAT_TX_QUEUE_SIZE,
+                              (unsigned)chunks, (unsigned)_txDropped);
         return;
     }
-    size_t slot = (g_txQueueHead + g_txQueueCount) % BITCHAT_TX_QUEUE_SIZE;
-    strncpy(g_txQueue[slot], text, sizeof(g_txQueue[slot]) - 1);
-    g_txQueue[slot][sizeof(g_txQueue[slot]) - 1] = '\0';
-    g_txQueueCount++;
-    BITCHAT_DEBUG_PRINTLN("TX queued for Bitchat (%u waiting)", (unsigned)g_txQueueCount);
+    for (size_t i = 0; i < chunks; i++) {
+        size_t slot = (g_txQueueHead + g_txQueueCount) % BITCHAT_TX_QUEUE_SIZE;
+        splitter.next(g_txQueue[slot]);
+        g_txQueueCount++;
+    }
+    BITCHAT_DEBUG_PRINTLN("TX queued %u chunk(s) for Bitchat (%u waiting%s)", (unsigned)chunks,
+                          (unsigned)g_txQueueCount, splitter.truncated() ? ", truncated" : "");
     processOutboundQueue();  // send right away if the budget allows
 }
 
@@ -2140,11 +2145,9 @@ void BitchatBridge::sendTextToBitchat(const char* text) {
     g_msgBuffer.flags = 0;  // No special flags - simple channel message
     g_msgBuffer.setSenderId64(_bitchatPeerId);
 
-    // Simple payload format - just copy the text content directly
-    size_t contentLen = strlen(text);
-    if (contentLen > BITCHAT_MAX_PAYLOAD_SIZE) {
-        contentLen = BITCHAT_MAX_PAYLOAD_SIZE;
-    }
+    // Simple payload format - just copy the text content directly. Chunks are already at
+    // most BITCHAT_MAX_PUBLIC_PAYLOAD bytes (iOS signature limit, see BitchatTextSplit.h).
+    size_t contentLen = BitchatTextSplitter::utf8Floor(text, strlen(text), BITCHAT_MAX_PUBLIC_PAYLOAD);
     memcpy(g_msgBuffer.payload, text, contentLen);
     g_msgBuffer.payloadLength = static_cast<uint16_t>(contentLen);
 
