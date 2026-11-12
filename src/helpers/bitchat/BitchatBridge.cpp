@@ -470,6 +470,15 @@ void BitchatBridge::handleRequestSync(const BitchatMessage& msg) {
 
     BITCHAT_DEBUG_PRINTLN("REQUEST_SYNC from %08lX", (unsigned long)(msg.getSenderId64() & 0xFFFFFFFF));
 
+    // Requests addressed to another peer are not ours to answer (broadcast = all 0xFF)
+    if (msg.hasRecipient()) {
+        uint64_t to = msg.getRecipientId64();
+        if (to != _bitchatPeerId && to != 0xFFFFFFFFFFFFFFFFULL) {
+            BITCHAT_DEBUG_PRINTLN("REQUEST_SYNC for another peer, ignored");
+            return;
+        }
+    }
+
     // Parse the GCS filter from the REQUEST_SYNC payload
     // The filter tells us which messages the requester already has
     GCSFilter filter;
@@ -513,7 +522,15 @@ void BitchatBridge::handleRequestSync(const BitchatMessage& msg) {
         }
 
 #if defined(ESP32) || defined(NRF52_PLATFORM)
-        _bleService.broadcastMessage(_messageHistory[i].msg);
+        // Like the apps' GossipSyncManager, sync replies go out with TTL 0 (neighbours only,
+        // never relayed further). TTL is not part of the signature. The BLE layer has no
+        // per-connection send, so the reply reaches every connected client, which in
+        // practice is the requester.
+        BitchatMessage& cached = _messageHistory[i].msg;
+        uint8_t ttl = cached.ttl;
+        cached.ttl = 0;
+        _bleService.broadcastMessage(cached);
+        cached.ttl = ttl;
         sent++;
 #endif
     }
