@@ -101,6 +101,21 @@ static char g_txQueue[BITCHAT_TX_QUEUE_SIZE][BITCHAT_TX_SLOT_SIZE];
 static size_t g_txQueueHead = 0;   // oldest entry
 static size_t g_txQueueCount = 0;
 
+// Directly received ANNOUNCE waiting for signature verification in loop(). Ed25519 verify
+// needs ~3 KB of stack, too much for the BLE receive call chain on NRF52.
+static struct {
+    bool pending;
+    uint64_t peerId;
+    uint64_t timestamp;     // announce timestamp (ms)
+    uint32_t rxMillis;      // millis() at receive, to age the timestamp until verified
+    uint8_t signingKey[32];
+    uint8_t signature[BITCHAT_SIGNATURE_SIZE];
+    uint16_t dataLen;       // signing preimage length (padded)
+} g_pendingTimeSync;
+static uint8_t g_timeSyncData[512];         // signing preimage of the pending announce
+static uint32_t g_lastTimeSyncVerifyMs = 0;  // millis() of the last verification attempt
+static const uint32_t TIME_SYNC_VERIFY_INTERVAL_MS = 10000;
+
 // PKCS#7 padding for Bitchat protocol signing (must match Android/iOS)
 // Block sizes: 256, 512, 1024, 2048 bytes
 static size_t applyPKCS7Padding(uint8_t* buffer, size_t dataLen, size_t bufferCapacity) {
@@ -164,6 +179,8 @@ BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, co
     , _hasReassembledMsg(false)
     , _timeOffset(0)
     , _timeSynced(false)
+    , _timeSyncVerified(false)
+    , _rtcSetByBridge(false)
     , _bootTimestamp(0)
     , _messagesRelayed(0)
     , _duplicatesDropped(0)
@@ -566,6 +583,9 @@ void BitchatBridge::loop() {
     // Process pending multi-part messages
     processPendingParts();
 
+    // Verify a deferred announce and maybe take the time from it (needs a shallow stack)
+    processPendingTimeSync();
+
     // Release paced MeshCore -> Bitchat messages
     processOutboundQueue();
 
@@ -823,54 +843,6 @@ const char* BitchatBridge::getChannelName(const mesh::GroupChannel& channel) {
     return _defaultChannelName;
 }
 
-void BitchatBridge::syncTimeFromPacket(uint64_t packetTimestamp) {
-#ifdef ARDUINO
-    // Only sync if the timestamp looks reasonable (after year 2024, before year 2100)
-    // Unix timestamp for 2024-01-01 00:00:00 UTC = 1704067200000 ms
-    // Unix timestamp for 2100-01-01 00:00:00 UTC = 4102444800000 ms
-    const uint64_t MIN_VALID_TIMESTAMP = 1704067200000ULL;  // 2024-01-01
-    const uint64_t MAX_VALID_TIMESTAMP = 4102444800000ULL;  // 2100-01-01
-
-    // Threshold for RTC sync - if RTC differs by more than this, update it
-    // This allows Bitchat to act as an NTP-like time source for the mesh
-    const uint32_t RTC_SYNC_THRESHOLD_SECS = 30;  // 30 seconds
-
-    if (packetTimestamp >= MIN_VALID_TIMESTAMP && packetTimestamp <= MAX_VALID_TIMESTAMP) {
-        uint64_t localMs = millis();
-        int64_t newOffset = static_cast<int64_t>(packetTimestamp) - static_cast<int64_t>(localMs);
-
-        // If this is first sync, or if the offset changed significantly (device was rebooted), update it
-        if (!_timeSynced || abs(newOffset - _timeOffset) > 60000) {  // > 1 minute drift
-            _timeOffset = newOffset;
-            bool wasFirstSync = !_timeSynced;
-            _timeSynced = true;
-
-            // Record boot timestamp on first sync (used to filter old synced messages)
-            if (wasFirstSync) {
-                _bootTimestamp = packetTimestamp;
-                BITCHAT_DEBUG_PRINTLN("Boot timestamp recorded: %lu sec", (unsigned long)(packetTimestamp / 1000ULL));
-            }
-            BITCHAT_DEBUG_PRINTLN("Time synced from Bitchat: offset=%ld ms", (long)(_timeOffset / 1000));
-        }
-
-        // Also sync the RTC if the difference is significant
-        // This allows other MeshCore components to benefit from Bitchat time sync
-        mesh::RTCClock* rtc = _mesh.getRTCClock();
-        if (rtc != nullptr) {
-            uint32_t bitchatTimeSecs = static_cast<uint32_t>(packetTimestamp / 1000ULL);
-            uint32_t rtcTime = rtc->getCurrentTime();
-            int32_t timeDiff = static_cast<int32_t>(bitchatTimeSecs) - static_cast<int32_t>(rtcTime);
-
-            if (abs(timeDiff) > RTC_SYNC_THRESHOLD_SECS) {
-                rtc->setCurrentTime(bitchatTimeSecs);
-                BITCHAT_DEBUG_PRINTLN("RTC synced from Bitchat: %u (was off by %d secs)",
-                                      bitchatTimeSecs, timeDiff);
-            }
-        }
-    }
-#endif
-}
-
 bool BitchatBridge::parseAnnounceTLV(const uint8_t* payload, size_t len, char* nickname, size_t nickLen) {
     // ANNOUNCE payload is TLV encoded: [type:1][length:1][value:N]...
     size_t offset = 0;
@@ -981,6 +953,153 @@ static uint64_t getCompileTimeMs() {
     return seconds * 1000ULL;
 }
 
+// A clock earlier than this firmware's build date is wrong. This also rejects the seeds
+// boards fall back to after losing time: 1970, VolatileRTCClock's May 2024 and
+// ESP32Board's RTC_TIME_MIN (1 Mar 2026). Two days of slack cover the rough
+// getCompileTimeMs() calendar maths.
+static uint32_t minPlausibleEpoch() {
+    static uint32_t minEpoch = 0;
+    if (minEpoch == 0) {
+        minEpoch = static_cast<uint32_t>(getCompileTimeMs() / 1000ULL) - 2 * 86400UL;
+    }
+    return minEpoch;
+}
+
+static bool isPlausibleEpoch(uint32_t secs) {
+    const uint32_t MAX_PLAUSIBLE_EPOCH = 4102444800UL;  // 2100-01-01
+    return secs >= minPlausibleEpoch() && secs < MAX_PLAUSIBLE_EPOCH;
+}
+
+BitchatTimeSyncPolicy::Trust BitchatBridge::clockTrust() {
+    if (_timeSynced) {
+        return _timeSyncVerified ? BitchatTimeSyncPolicy::CLOCK_TRUSTED : BitchatTimeSyncPolicy::CLOCK_WEAK;
+    }
+    mesh::RTCClock* rtc = _mesh.getRTCClock();
+    if (rtc != NULL && isPlausibleEpoch(rtc->getCurrentTime())) {
+        return BitchatTimeSyncPolicy::CLOCK_TRUSTED;
+    }
+    return BitchatTimeSyncPolicy::CLOCK_UNTRUSTED;
+}
+
+void BitchatBridge::adoptTime(uint64_t packetTimestamp, bool verified) {
+#ifdef ARDUINO
+    int64_t before = static_cast<int64_t>(getCurrentTimeMs());
+    _timeOffset = static_cast<int64_t>(packetTimestamp) - static_cast<int64_t>(millis());
+    if (!_timeSynced) {
+        // Used to drop messages older than our first sync (stale history after reboot)
+        _bootTimestamp = packetTimestamp;
+    }
+    _timeSynced = true;
+    _timeSyncVerified = verified;
+    BITCHAT_DEBUG_PRINTLN("Time synced from %s announce: moved %ld s",
+                          verified ? "verified" : "unverified",
+                          (long)((static_cast<int64_t>(packetTimestamp) - before) / 1000));
+
+    // Set the MeshCore RTC only when it could not be trusted (1970 / seed date after a
+    // reset), or when it was the bridge that set it. An RTC set by the companion app, GPS
+    // or an RTC chip is left alone.
+    mesh::RTCClock* rtc = _mesh.getRTCClock();
+    if (rtc != nullptr) {
+        uint32_t secs = static_cast<uint32_t>(packetTimestamp / 1000ULL);
+        uint32_t rtcNow = rtc->getCurrentTime();
+        if (!isPlausibleEpoch(rtcNow) || _rtcSetByBridge) {
+            int64_t diff = static_cast<int64_t>(secs) - static_cast<int64_t>(rtcNow);
+            if (diff > 30 || diff < -30) {
+                rtc->setCurrentTime(secs);
+                _rtcSetByBridge = true;
+                BITCHAT_DEBUG_PRINTLN("RTC set from Bitchat: %lu", (unsigned long)secs);
+            }
+        }
+    }
+#endif
+}
+
+void BitchatBridge::onDirectAnnounceTime(const BitchatMessage& msg) {
+#ifdef ARDUINO
+    const uint64_t MIN_VALID_TIMESTAMP = 1704067200000ULL;  // 2024-01-01
+    const uint64_t MAX_VALID_TIMESTAMP = 4102444800000ULL;  // 2100-01-01
+    if (msg.timestamp < MIN_VALID_TIMESTAMP || msg.timestamp > MAX_VALID_TIMESTAMP) return;
+
+    uint64_t peerId = msg.getSenderId64();
+    BitchatTimeSyncPolicy::Trust trust = clockTrust();
+    int64_t delta = static_cast<int64_t>(msg.timestamp) - static_cast<int64_t>(getCurrentTimeMs());
+
+    // An untrustworthy clock takes any direct announce right away: no app accepts our
+    // announces with a 1970 or seed clock anyway. Verification below may upgrade it.
+    if (_timePolicy.shouldAdopt(trust, false, delta, peerId, millis())) {
+        adoptTime(msg.timestamp, false);
+        trust = clockTrust();
+        delta = 0;
+    }
+    if (!BitchatTimeSyncPolicy::needsVerification(trust, delta)) return;
+    // One at a time and at most every 10 s; announces repeat every few seconds anyway
+    if (g_pendingTimeSync.pending) return;
+    if (g_lastTimeSyncVerifyMs != 0 && millis() - g_lastTimeSyncVerifyMs < TIME_SYNC_VERIFY_INTERVAL_MS) return;
+
+    // Signature check is only possible when we can rebuild the signed bytes exactly:
+    // a v1 packet whose payload arrived uncompressed.
+    if (msg.version != BITCHAT_VERSION || !msg.hasSignature() ||
+        msg.wirePayloadLength != msg.payloadLength) {
+        return;
+    }
+
+    // The announce must carry its keys, and the sender ID must be derived from the noise key
+    const uint8_t* noiseKey = nullptr;
+    const uint8_t* signingKey = nullptr;
+    size_t off = 0;
+    while (off + 2 <= msg.payloadLength) {
+        uint8_t type = msg.payload[off];
+        uint8_t len = msg.payload[off + 1];
+        off += 2;
+        if (off + len > msg.payloadLength) return;
+        if (type == BITCHAT_TLV_NOISE_PUBKEY && len == 32) noiseKey = &msg.payload[off];
+        if (type == BITCHAT_TLV_ED25519_PUBKEY && len == 32) signingKey = &msg.payload[off];
+        off += len;
+    }
+    if (noiseKey == nullptr || signingKey == nullptr || derivePeerId(noiseKey) != peerId) return;
+
+    // Signing preimage: the packet with TTL 0, no signature and the signature/RSR flags
+    // cleared, PKCS#7-padded (toBinaryDataForSigning() in both apps)
+    size_t len = BitchatProtocol::serializeMessage(msg, g_timeSyncData, sizeof(g_timeSyncData));
+    if (len <= BITCHAT_SIGNATURE_SIZE) return;
+    len -= BITCHAT_SIGNATURE_SIZE;
+    g_timeSyncData[2] = 0;                                              // TTL
+    g_timeSyncData[11] &= ~(BITCHAT_FLAG_HAS_SIGNATURE | 0x10);         // flags (0x10 = iOS isRSR)
+    len = applyPKCS7Padding(g_timeSyncData, len, sizeof(g_timeSyncData));
+
+    g_pendingTimeSync.peerId = peerId;
+    g_pendingTimeSync.timestamp = msg.timestamp;
+    g_pendingTimeSync.rxMillis = millis();
+    memcpy(g_pendingTimeSync.signingKey, signingKey, 32);
+    memcpy(g_pendingTimeSync.signature, msg.signature, BITCHAT_SIGNATURE_SIZE);
+    g_pendingTimeSync.dataLen = static_cast<uint16_t>(len);
+    g_pendingTimeSync.pending = true;
+#endif
+}
+
+void BitchatBridge::processPendingTimeSync() {
+#ifdef ARDUINO
+    if (!g_pendingTimeSync.pending) return;
+    g_pendingTimeSync.pending = false;
+    g_lastTimeSyncVerifyMs = millis() | 1;  // never 0
+
+    mesh::Identity signer(g_pendingTimeSync.signingKey);
+    if (!signer.verify(g_pendingTimeSync.signature, g_timeSyncData, g_pendingTimeSync.dataLen)) {
+        BITCHAT_DEBUG_PRINTLN("Announce signature invalid, not used for time");
+        return;
+    }
+
+    // Age the timestamp by the time it waited here
+    uint32_t now = millis();
+    uint64_t ts = g_pendingTimeSync.timestamp + (now - g_pendingTimeSync.rxMillis);
+    BitchatTimeSyncPolicy::Trust trust = clockTrust();
+    int64_t delta = static_cast<int64_t>(ts) - static_cast<int64_t>(getCurrentTimeMs());
+    if (_timePolicy.shouldAdopt(trust, true, delta, g_pendingTimeSync.peerId, now)) {
+        adoptTime(ts, true);
+    }
+#endif
+}
+
 uint64_t BitchatBridge::getCurrentTimeMs() {
 #ifdef ARDUINO
     // If we have synced time from a Bitchat client, use that (most reliable)
@@ -991,19 +1110,17 @@ uint64_t BitchatBridge::getCurrentTimeMs() {
     // Next best source: the Meshcore RTC (set by the companion app / GPS / RTC chip).
     // Bitchat rejects announces more than 10 minutes off wall clock, so a plausible
     // RTC value is much better than a hardcoded bootstrap date.
-    const uint32_t MIN_PLAUSIBLE_EPOCH = 1767225600UL;  // Jan 1, 2026
     mesh::RTCClock* rtc = _mesh.getRTCClock();
     if (rtc != NULL) {
         uint32_t now = rtc->getCurrentTime();
-        if (now > MIN_PLAUSIBLE_EPOCH) {
+        if (isPlausibleEpoch(now)) {
             return static_cast<uint64_t>(now) * 1000ULL;
         }
     }
 
-    // Fallback: hardcoded date + millis. Announces will be rejected by current Bitchat
-    // builds until we hear a peer packet and sync, but the bridge still receives.
-    const uint64_t BOOTSTRAP_TIME_MS = (uint64_t)MIN_PLAUSIBLE_EPOCH * 1000ULL;
-    return BOOTSTRAP_TIME_MS + millis();
+    // Fallback: build date + millis. Announces will be rejected by current Bitchat
+    // builds until we hear a direct announce and sync, but the bridge still receives.
+    return static_cast<uint64_t>(minPlausibleEpoch()) * 1000ULL + millis();
 #else
     return 0;
 #endif
@@ -1131,12 +1248,6 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
 
     BITCHAT_PACKETDUMP("BLE_RX", msg.payload, msg.payloadLength);
 
-    // Sync time from incoming Bitchat packets (Android sends valid Unix timestamps)
-    // This is critical: our announces will be rejected as stale without valid time
-    if (msg.timestamp > 0) {
-        syncTimeFromPacket(msg.timestamp);
-    }
-
     // Check for duplicates - log the hash inputs for debugging
 #if BITCHAT_DEBUG_PACKETDUMP
     {
@@ -1260,6 +1371,11 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
                 uint64_t peerId = msg.getSenderId64();
                 cachePeer(peerId, nickname);
                 BITCHAT_DEBUG_PRINTLN("Cached peer: %s (%08lX)", nickname, (unsigned long)(peerId & 0xFFFFFFFF));
+            }
+            // Only an announce heard directly (TTL still at the app's maximum) is fresh enough
+            // to set the clock from; relayed and synced packets carry older timestamps.
+            if (msg.ttl == DEFAULT_TTL) {
+                onDirectAnnounceTime(msg);
             }
             break;
         }

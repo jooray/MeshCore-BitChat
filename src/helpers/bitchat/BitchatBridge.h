@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BitchatProtocol.h"
+#include "BitchatTimeSync.h"
 
 #if defined(ESP32)
 #include "BitchatBLEService.h"
@@ -231,11 +232,13 @@ private:
     static BitchatMessage _reassembledMsg;  // Buffer for reassembled message awaiting processing
     bool _hasReassembledMsg;         // True when _reassembledMsg contains a message to process
 
-    // Time synchronization (calibrated from received Bitchat packets)
-    // Android sends Unix timestamps; we sync from them since ESP32 may not have valid RTC
+    // Time synchronization from directly received Bitchat ANNOUNCEs (see BitchatTimeSync.h)
     int64_t _timeOffset;      // Offset to add to millis() to get Unix time (ms)
-    bool _timeSynced;         // True after receiving at least one valid timestamp from Android
+    bool _timeSynced;         // True once the clock was taken from a Bitchat announce
+    bool _timeSyncVerified;   // True if that announce had a verified signature
+    bool _rtcSetByBridge;     // RTC was implausible and the bridge set it, so it may correct it
     uint64_t _bootTimestamp;  // Unix timestamp (ms) when time was first synced (used to filter old messages)
+    BitchatTimeSyncPolicy _timePolicy;
 
     // Statistics
     uint32_t _messagesRelayed;
@@ -422,11 +425,17 @@ private:
      */
     uint64_t getCurrentTimeMs();
 
-    /**
-     * Synchronize local time from a received Bitchat packet timestamp
-     * This is critical for proper operation - Android rejects announces with stale timestamps
-     */
-    void syncTimeFromPacket(uint64_t packetTimestamp);
+    /** Trust level of the clock getCurrentTimeMs() currently returns */
+    BitchatTimeSyncPolicy::Trust clockTrust();
+
+    /** Offer a directly received (TTL 7) ANNOUNCE as a time source */
+    void onDirectAnnounceTime(const BitchatMessage& msg);
+
+    /** Verify a deferred announce signature and apply the time policy (called from loop()) */
+    void processPendingTimeSync();
+
+    /** Take packetTimestamp (ms) as the current time */
+    void adoptTime(uint64_t packetTimestamp, bool verified);
 
     /**
      * Parse ANNOUNCE message TLV to extract nickname
