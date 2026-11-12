@@ -1422,8 +1422,14 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
             break;
 
         case BITCHAT_MSG_VOICE_FRAME:
-            // Live push-to-talk audio: ephemeral and far too large for LoRa
-            BITCHAT_DEBUG_PRINTLN("Skipping voice frame (not supported)");
+        case BITCHAT_MSG_COURIER_ACK_A:
+        case BITCHAT_MSG_COURIER_ACK_B:
+        case BITCHAT_MSG_ANNOUNCE_V2:
+        case BITCHAT_MSG_VIDEO_FRAME:
+            // Live push-to-talk audio / live video (ephemeral, far too large for LoRa), and
+            // types the apps reserved but do not emit yet. validateMessage() already drops
+            // these at parse time; listed here so they are never bridged.
+            BITCHAT_DEBUG_PRINTLN("Skipping message type 0x%02X (not bridged)", msg.type);
             break;
 
         case BITCHAT_MSG_FRAGMENT_NEW:

@@ -47,6 +47,10 @@ enum BitchatMessageType : uint8_t {
     BITCHAT_MSG_REQUEST_SYNC = 0x21,
     BITCHAT_MSG_FILE_TRANSFER = 0x22,
     BITCHAT_MSG_VOICE_FRAME = 0x29,   // ephemeral push-to-talk frame, never gossiped
+    BITCHAT_MSG_COURIER_ACK_A = 0x2A, // reserved by iOS for courier spray acks
+    BITCHAT_MSG_COURIER_ACK_B = 0x2B, // reserved by iOS for courier spray acks
+    BITCHAT_MSG_ANNOUNCE_V2 = 0x2C,   // iOS identity-free presence, not emitted yet
+    BITCHAT_MSG_VIDEO_FRAME = 0x2D,   // live video frame (iOS PR #1827), ephemeral
     BITCHAT_MSG_FRAGMENT = 0xFF
 };
 
