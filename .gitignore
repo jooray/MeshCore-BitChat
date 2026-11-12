@@ -20,3 +20,5 @@ AGENTS.md
 .venv/
 venv/
 platformio.local.ini
+
+tmp/
