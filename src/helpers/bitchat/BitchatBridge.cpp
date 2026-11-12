@@ -1,4 +1,5 @@
 #include "BitchatBridge.h"
+#include "BitchatDebugSerial.h"
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -20,7 +21,7 @@ extern "C" {
 
 // Debug output - Adafruit nRF52 core supports Serial.printf
 #if BITCHAT_DEBUG
-  #define BITCHAT_DEBUG_PRINTLN(...) do { Serial.printf("BITCHAT_BRIDGE: "); Serial.printf(__VA_ARGS__); Serial.println(); } while(0)
+  #define BITCHAT_DEBUG_PRINTLN(...) do { BITCHAT_SERIAL.printf("BITCHAT_BRIDGE: "); BITCHAT_SERIAL.printf(__VA_ARGS__); BITCHAT_SERIAL.println(); } while(0)
 #else
   #define BITCHAT_DEBUG_PRINTLN(...) {}
 #endif
@@ -28,12 +29,12 @@ extern "C" {
 // Verbose packet hex dump macro (separate from BITCHAT_DEBUG for optional verbosity)
 #if BITCHAT_DEBUG_PACKETDUMP
 static void dumpPacketHex(const char* label, const uint8_t* data, size_t len) {
-    Serial.printf("PACKETDUMP [%s] (%u bytes):\n", label, (unsigned)len);
+    BITCHAT_SERIAL.printf("PACKETDUMP [%s] (%u bytes):\n", label, (unsigned)len);
     for (size_t i = 0; i < len; i++) {
-        Serial.printf("%02X ", data[i]);
-        if ((i + 1) % 16 == 0) Serial.println();
+        BITCHAT_SERIAL.printf("%02X ", data[i]);
+        if ((i + 1) % 16 == 0) BITCHAT_SERIAL.println();
     }
-    if (len % 16 != 0) Serial.println();
+    if (len % 16 != 0) BITCHAT_SERIAL.println();
 }
   #define BITCHAT_PACKETDUMP(label, data, len) dumpPacketHex(label, data, len)
 #else
@@ -52,7 +53,7 @@ static void dumpPacketHex(const char* label, const uint8_t* data, size_t len) {
       uint32_t stackSize = LOOP_STACK_SZ * 4; \
       uint32_t maxUsed = stackSize - minFree; \
       uint32_t usage = (maxUsed * 100) / stackSize; \
-      Serial.printf("STACK_CHECKPOINT [%s]: used=%u/%u (%u%%), free=%u\n", \
+      BITCHAT_SERIAL.printf("STACK_CHECKPOINT [%s]: used=%u/%u (%u%%), free=%u\n", \
         label, (unsigned)maxUsed, (unsigned)stackSize, (unsigned)usage, (unsigned)minFree); \
     } \
   } while(0)
@@ -243,7 +244,7 @@ void BitchatBridge::begin() {
     // Log that decompression buffers are statically allocated
     // These are allocated at compile time in .bss section (not heap malloc)
 #if defined(NRF52_PLATFORM)
-    Serial.printf("BITCHAT_BRIDGE: Decompression buffers statically allocated (%u bytes)\n",
+    BITCHAT_SERIAL.printf("BITCHAT_BRIDGE: Decompression buffers statically allocated (%u bytes)\n",
                  (unsigned)(sizeof(_decompressorStatic) + sizeof(_decompBufferStatic)));
 #endif
 
@@ -547,16 +548,16 @@ void BitchatBridge::loop() {
     }
 
     if (firstLoopAfterConnect) {
-        Serial.println("DEBUG_CRASH: BitchatBridge::loop after _bleService.loop()");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BitchatBridge::loop after _bleService.loop()");
+        BITCHAT_SERIAL.flush();
     }
 
     // Process pending relays (multi-bridge collision avoidance with random delay)
     processPendingRelays();
 
     if (firstLoopAfterConnect) {
-        Serial.println("DEBUG_CRASH: BitchatBridge::loop after processPendingRelays()");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BitchatBridge::loop after processPendingRelays()");
+        BITCHAT_SERIAL.flush();
     }
 
     // Process pending multi-part messages
@@ -572,8 +573,8 @@ void BitchatBridge::loop() {
     }
 
     if (firstLoopAfterConnect) {
-        Serial.println("DEBUG_CRASH: BitchatBridge::loop after processPendingParts()");
-        Serial.flush();
+        BITCHAT_SERIAL.println("DEBUG_CRASH: BitchatBridge::loop after processPendingParts()");
+        BITCHAT_SERIAL.flush();
         firstLoopAfterConnect = false;
     }
 
@@ -695,20 +696,20 @@ bool BitchatBridge::hasBitchatClient() const {
 }
 #elif defined(NRF52_PLATFORM)
 bool BitchatBridge::beginStandalone(const char* deviceName) {
-    Serial.println("BITCHAT_BRIDGE: beginStandalone (NRF52) entry");
-    Serial.print("BITCHAT_BRIDGE: deviceName=");
-    Serial.println(deviceName);
-    Serial.print("BITCHAT_BRIDGE: this=");
-    Serial.println((unsigned long)this, HEX);
-    Serial.flush();
+    BITCHAT_SERIAL.println("BITCHAT_BRIDGE: beginStandalone (NRF52) entry");
+    BITCHAT_SERIAL.print("BITCHAT_BRIDGE: deviceName=");
+    BITCHAT_SERIAL.println(deviceName);
+    BITCHAT_SERIAL.print("BITCHAT_BRIDGE: this=");
+    BITCHAT_SERIAL.println((unsigned long)this, HEX);
+    BITCHAT_SERIAL.flush();
 
     // Initialize Bluefruit BLE with Bitchat service
-    Serial.println("BITCHAT_BRIDGE: Calling _bleService.beginStandalone()");
-    Serial.flush();
+    BITCHAT_SERIAL.println("BITCHAT_BRIDGE: Calling _bleService.beginStandalone()");
+    BITCHAT_SERIAL.flush();
     bool result = _bleService.beginStandalone(deviceName, this);
-    Serial.print("BITCHAT_BRIDGE: _bleService.beginStandalone() returned: ");
-    Serial.println(result);
-    Serial.flush();
+    BITCHAT_SERIAL.print("BITCHAT_BRIDGE: _bleService.beginStandalone() returned: ");
+    BITCHAT_SERIAL.println(result);
+    BITCHAT_SERIAL.flush();
 
     if (!result) {
         BITCHAT_DEBUG_PRINTLN("Failed to start BLE service");
@@ -1014,10 +1015,10 @@ void BitchatBridge::sendPeerAnnouncement() {
 #if BITCHAT_DEBUG
     // Print timestamp in seconds (fits in 32-bit for valid times through 2106)
     uint32_t timestampSec = (uint32_t)(timestamp / 1000ULL);
-    Serial.print("BITCHAT_BRIDGE: Announce: timestamp_sec=");
-    Serial.print(timestampSec);
-    Serial.print(" (expected ~1767000000 for Jan 2026), synced=");
-    Serial.println(_timeSynced ? 1 : 0);
+    BITCHAT_SERIAL.print("BITCHAT_BRIDGE: Announce: timestamp_sec=");
+    BITCHAT_SERIAL.print(timestampSec);
+    BITCHAT_SERIAL.print(" (expected ~1767000000 for Jan 2026), synced=");
+    BITCHAT_SERIAL.println(_timeSynced ? 1 : 0);
 #endif
 
     // Use global buffer to avoid stack overflow on NRF52
@@ -1043,8 +1044,8 @@ void BitchatBridge::sendPeerAnnouncement() {
     } else {
         BITCHAT_DEBUG_PRINTLN("FAILED to send peer announcement");
     }
-    Serial.println("DEBUG_CRASH: sendPeerAnnouncement about to return");
-    Serial.flush();
+    BITCHAT_SERIAL.println("DEBUG_CRASH: sendPeerAnnouncement about to return");
+    BITCHAT_SERIAL.flush();
 
     STACK_CHECKPOINT("sendPeerAnnouncement() exit");
 #endif
@@ -1108,21 +1109,21 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
     _processingMessage = true;  // Set guard to prevent announcement during processing
 
     uint64_t msgSender = msg.getSenderId64();
-    Serial.printf("PROCESS_MSG: type=0x%02X payloadLen=%u sender=%08lX ts=%lu\n",
+    BITCHAT_SERIAL.printf("PROCESS_MSG: type=0x%02X payloadLen=%u sender=%08lX ts=%lu\n",
                   msg.type, msg.payloadLength,
                   (unsigned long)(msgSender & 0xFFFFFFFF),
                   (unsigned long)(msg.timestamp / 1000ULL));
-    Serial.flush();
+    BITCHAT_SERIAL.flush();
 
     // Full payload hex dump for MESSAGE types
     if (msg.type == BITCHAT_MSG_MESSAGE) {
-        Serial.println("REDUNDANT_DEBUG: ====== MESSAGE PAYLOAD HEX ======");
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: ====== MESSAGE PAYLOAD HEX ======");
         for (uint16_t i = 0; i < msg.payloadLength && i < 256; i++) {
-            Serial.printf("%02X", msg.payload[i]);
+            BITCHAT_SERIAL.printf("%02X", msg.payload[i]);
         }
-        Serial.println();
-        Serial.println("REDUNDANT_DEBUG: ====== END MESSAGE PAYLOAD ======");
-        Serial.flush();
+        BITCHAT_SERIAL.println();
+        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: ====== END MESSAGE PAYLOAD ======");
+        BITCHAT_SERIAL.flush();
     }
 
     BITCHAT_PACKETDUMP("BLE_RX", msg.payload, msg.payloadLength);
@@ -1138,7 +1139,7 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
     {
         uint64_t senderId = msg.getSenderId64();
         uint32_t timestampSecs = static_cast<uint32_t>(msg.timestamp / 1000ULL);
-        Serial.printf("DEDUP_CHECK: sender=%08lX ts_sec=%lu type=%02X payloadLen=%u\n",
+        BITCHAT_SERIAL.printf("DEDUP_CHECK: sender=%08lX ts_sec=%lu type=%02X payloadLen=%u\n",
                       (unsigned long)(senderId & 0xFFFFFFFF), (unsigned long)timestampSecs, msg.type, msg.payloadLength);
         if (msg.payloadLength > 0) {
             size_t hashBytes = msg.payloadLength < 16 ? msg.payloadLength : 16;
@@ -1298,14 +1299,14 @@ void BitchatBridge::processBitchatMessage(const BitchatMessage& msg) {
 
         case BITCHAT_MSG_REQUEST_SYNC:
             handleRequestSync(msg);
-            Serial.println("BITCHAT_BRIDGE: handleRequestSync() returned OK");
+            BITCHAT_SERIAL.println("BITCHAT_BRIDGE: handleRequestSync() returned OK");
             break;
 
         default:
             BITCHAT_DEBUG_PRINTLN("Unhandled message type: 0x%02X", msg.type);
             break;
     }
-    Serial.println("BITCHAT_BRIDGE: processBitchatMessage() COMPLETE");
+    BITCHAT_SERIAL.println("BITCHAT_BRIDGE: processBitchatMessage() COMPLETE");
 
     _processingMessage = false;  // Clear guard after processing complete
 }
@@ -1681,7 +1682,7 @@ void BitchatBridge::relayChannelMessageToMesh_Internal(const char* senderNick, c
     int numParts = (contentLen + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
     bool truncated = false;
     if (numParts > (int)MAX_MESSAGE_PARTS) {
-        Serial.printf("BITCHAT_BRIDGE: WARNING - Message too long (%d bytes), truncating from %d to %d parts\n",
+        BITCHAT_SERIAL.printf("BITCHAT_BRIDGE: WARNING - Message too long (%d bytes), truncating from %d to %d parts\n",
                       (int)contentLen, numParts, (int)MAX_MESSAGE_PARTS);
         numParts = MAX_MESSAGE_PARTS;  // Cap for reliability over LoRa
         truncated = true;
@@ -1970,7 +1971,7 @@ void BitchatBridge::handleFragment(const BitchatMessage& msg) {
 void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, uint32_t timestamp,
                                             const char* senderName, const char* text) {
 #if defined(ESP32) || defined(NRF52_PLATFORM)
-    Serial.println("BITCHAT_BRIDGE: >>> onMeshcoreGroupMessage() ENTRY <<<");
+    BITCHAT_SERIAL.println("BITCHAT_BRIDGE: >>> onMeshcoreGroupMessage() ENTRY <<<");
     BITCHAT_DEBUG_PRINTLN("MESH_RX: sender=%s text=%s", senderName, text ? text : "(null)");
     BITCHAT_DEBUG_PRINTLN("MESH_RX: hasClient=%d, BLEactive=%d",
                           _bleService.hasConnectedClient() ? 1 : 0,
@@ -2003,7 +2004,7 @@ void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, ui
 
     // Paced: bitchat-android hides a sender's messages beyond its rate budget
     enqueueBitchatOutbound(g_meshTxContent);
-    Serial.println("BITCHAT_BRIDGE: <<< onMeshcoreGroupMessage() EXIT <<<");
+    BITCHAT_SERIAL.println("BITCHAT_BRIDGE: <<< onMeshcoreGroupMessage() EXIT <<<");
 #endif
 }
 

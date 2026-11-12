@@ -1,4 +1,5 @@
 #include "BitchatBLEService.h"
+#include "BitchatDebugSerial.h"
 
 #ifdef ESP32
 
@@ -6,7 +7,7 @@
 #include <esp_bt.h>  // For esp_ble_tx_power_set
 
 #if BITCHAT_DEBUG
-  #define BITCHAT_DEBUG_PRINTLN(F, ...) Serial.printf("BITCHAT: " F "\n", ##__VA_ARGS__)
+  #define BITCHAT_DEBUG_PRINTLN(F, ...) BITCHAT_SERIAL.printf("BITCHAT: " F "\n", ##__VA_ARGS__)
 #else
   #define BITCHAT_DEBUG_PRINTLN(...) {}
 #endif
@@ -14,12 +15,12 @@
 // Verbose packet hex dump macro (separate from BITCHAT_DEBUG for optional verbosity)
 #if BITCHAT_DEBUG_PACKETDUMP
 static void dumpPacketHex(const char* label, const uint8_t* data, size_t len) {
-    Serial.printf("PACKETDUMP [%s] (%zu bytes):\n", label, len);
+    BITCHAT_SERIAL.printf("PACKETDUMP [%s] (%zu bytes):\n", label, len);
     for (size_t i = 0; i < len; i++) {
-        Serial.printf("%02X ", data[i]);
-        if ((i + 1) % 16 == 0) Serial.println();
+        BITCHAT_SERIAL.printf("%02X ", data[i]);
+        if ((i + 1) % 16 == 0) BITCHAT_SERIAL.println();
     }
-    if (len % 16 != 0) Serial.println();
+    if (len % 16 != 0) BITCHAT_SERIAL.println();
 }
   #define BITCHAT_PACKETDUMP(label, data, len) dumpPacketHex(label, data, len)
 #else
