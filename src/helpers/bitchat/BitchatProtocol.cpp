@@ -475,6 +475,13 @@ bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
         case BITCHAT_MSG_FILE_TRANSFER:
         case BITCHAT_MSG_FRAGMENT:
             break;
+        case BITCHAT_MSG_VOICE_FRAME:
+        case BITCHAT_MSG_COURIER_ACK_A:
+        case BITCHAT_MSG_COURIER_ACK_B:
+        case BITCHAT_MSG_ANNOUNCE_V2:
+        case BITCHAT_MSG_VIDEO_FRAME:
+            // Known, but never bridged (live audio/video, reserved types): drop early
+            return false;
         default:
             BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - unknown type 0x%02X\n", msg.type);
             return false;
