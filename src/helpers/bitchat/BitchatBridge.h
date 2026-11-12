@@ -557,8 +557,8 @@ private:
     uint32_t _txLastRefillMs;
     uint32_t _txDropped;
 
-    /** Queue a formatted MeshCore #mesh text for paced broadcast to Bitchat */
-    void enqueueBitchatOutbound(const char* text);
+    /** Split a MeshCore #mesh message into Bitchat-sized chunks and queue them for paced broadcast */
+    void enqueueBitchatOutbound(const char* senderName, const char* text);
 
     /** Release the oldest queued outbound message if the rate buckets admit it */
     void processOutboundQueue();
