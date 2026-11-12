@@ -45,7 +45,8 @@ public:
      * @param identity Reference to this node's LocalIdentity
      * @param nodeName This node's display name
      */
-    BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName);
+    BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName,
+                  const uint8_t& pathHashMode);
 
     /**
      * Initialize the bridge
@@ -187,6 +188,7 @@ private:
     mesh::Mesh& _mesh;
     mesh::LocalIdentity& _identity;
     const char* _nodeName;
+    const uint8_t& _pathHashMode;
 
 #if defined(ESP32) || defined(NRF52_PLATFORM)
     BitchatBLEService _bleService;
