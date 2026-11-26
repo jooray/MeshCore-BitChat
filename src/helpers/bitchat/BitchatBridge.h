@@ -223,8 +223,9 @@ private:
 
     // Announcement timing
     uint32_t _lastAnnounceTime;
-    volatile bool _pendingAnnounce;  // Flag to defer announcement to main loop (BLE callback has limited stack)
-    volatile bool _processingMessage;  // Guard against re-entrant message processing (prevents stack explosion)
+    volatile bool _pendingAnnounce;      // Deferred direct ANNOUNCE (TTL 7)
+    volatile bool _pendingSyncAnnounce;  // Deferred REQUEST_SYNC ANNOUNCE (TTL 0, avoids Android sync loop)
+    volatile bool _processingMessage;    // Guard against re-entrant message processing (prevents stack explosion)
     // Matches the app's own policy: announce often while undiscovered, then back off to
     // keepalive once a client is connected and already knows us.
     static const uint32_t ANNOUNCE_INTERVAL_MS = 4000;  // 4 seconds when no client connected
@@ -356,7 +357,7 @@ private:
     /**
      * Send peer announcement to connected Bitchat clients
      */
-    void sendPeerAnnouncement();
+    void sendPeerAnnouncement(uint8_t ttl = DEFAULT_TTL);
 
     /**
      * Sign a Bitchat message with the companion's Ed25519 identity

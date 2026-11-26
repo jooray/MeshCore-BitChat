@@ -147,6 +147,7 @@ BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, co
     , _channelConfigured(false)
     , _lastAnnounceTime(0)
     , _pendingAnnounce(false)
+    , _pendingSyncAnnounce(false)
     , _processingMessage(false)
     , _reassembledRawLen(0)
     , _hasReassembledMsg(false)
@@ -435,9 +436,9 @@ void BitchatBridge::handleRequestSync(const BitchatMessage& msg) {
 #endif
     }
 
-    if (_lastAnnounceTime == 0 || (uint32_t)(now - _lastAnnounceTime) >= 2000) {
-        _pendingAnnounce = true;
-    }
+    // Reply with TTL 0 (SYNC_TTL_HOPS) so Android's DirectLinkAnnouncementPolicy
+    // does not re-trigger scheduleInitialSyncToPeer() in a loop.
+    _pendingSyncAnnounce = true;
 
     BITCHAT_DEBUG_PRINTLN("REQUEST_SYNC response: sent %d messages, skipped %d (filter=%s)",
                           sent, skipped, hasFilter ? "yes" : "no");
@@ -522,9 +523,13 @@ void BitchatBridge::loop() {
     if (_pendingAnnounce && !_processingMessage) {
         STACK_CHECKPOINT("loop() before sendPeerAnnouncement");
         _pendingAnnounce = false;
-        sendPeerAnnouncement();
+        _pendingSyncAnnounce = false;
+        sendPeerAnnouncement(DEFAULT_TTL);
         _lastAnnounceTime = now;
         STACK_CHECKPOINT("loop() after sendPeerAnnouncement");
+    } else if (_pendingSyncAnnounce && !_processingMessage) {
+        _pendingSyncAnnounce = false;
+        sendPeerAnnouncement(0);
     }
 
     // Periodically expire old messages from cache (every 30 seconds)
@@ -1052,7 +1057,7 @@ uint64_t BitchatBridge::getCurrentTimeMs() {
 #endif
 }
 
-void BitchatBridge::sendPeerAnnouncement() {
+void BitchatBridge::sendPeerAnnouncement(uint8_t ttl) {
 #if defined(ESP32) || defined(NRF52_PLATFORM)
     STACK_CHECKPOINT("sendPeerAnnouncement() entry");
 
@@ -1075,7 +1080,7 @@ void BitchatBridge::sendPeerAnnouncement() {
         _noisePublicKey,      // Curve25519 for Noise protocol
         _identity.pub_key,    // Ed25519 for signatures
         timestamp,
-        DEFAULT_TTL
+        ttl
     );
 
     STACK_CHECKPOINT("sendPeerAnnouncement() before signMessage");
