@@ -2,6 +2,10 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
+extern "C" void print_stack_usage(void);
+#endif
+
 #if defined(ENABLE_WIFI_INTERFACE) && defined(ENABLE_ESP_MDNS)
 #define HAS_ESP_MDNS
 #include <ESPmDNS.h>
@@ -18,7 +22,12 @@ static uint32_t _atoi(const char* sp) {
 }
 
 // interface manager
+// The meshsolar library (Heltec_mesh_solar target.h) does "#define NONE 1", which
+// breaks InterfaceType::NONE; hide the macro while the header is parsed.
+#pragma push_macro("NONE")
+#undef NONE
 #include <helpers/MultiSerialInterface.h>
+#pragma pop_macro("NONE")
 MultiSerialInterface interface_manager;
 
 // include bluetooth interface
@@ -112,9 +121,16 @@ MultiSerialInterface interface_manager;
 #endif
 
 /* GLOBAL OBJECTS */
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  #include <helpers/bitchat/BitchatBridge.h>
+#endif
 StdRNG fast_rng;
 SimpleMeshTables tables;
 MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
+
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  BitchatBridge* bitchat_bridge = nullptr;
+#endif
 
 /* END GLOBAL OBJECTS */
 
@@ -138,7 +154,35 @@ static void loopDuringDisplayRefresh();
 
 void setup() {
   Serial.begin(115200);
+
+  // Early debug - wait for USB serial on NRF52
+  #if defined(NRF52_PLATFORM)
+  // Wait for USB serial to be ready (with timeout)
+  uint32_t serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart < 3000)) {
+    delay(10);
+  }
+  // Serial port ready - skip boot wait since crashes happen much later
+  #endif
+  Serial.println("\n\n=== BOOT START ===");
+  Serial.flush();
+
   board.begin();
+  Serial.println("board.begin() done");
+  Serial.flush();
+
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
+  // Paint ISR stack with canary pattern for high-water marking
+  extern unsigned long __StackLimit;
+  extern unsigned long __StackTop;
+  uint32_t* isr_stack_ptr = (uint32_t*)&__StackLimit;
+  uint32_t isr_stack_words = ((uint32_t)&__StackTop - (uint32_t)&__StackLimit) / 4;
+  for (uint32_t i = 0; i < isr_stack_words; i++) {
+      isr_stack_ptr[i] = 0xa5a5a5a5;  // FreeRTOS canary pattern
+  }
+  Serial.println("ISR stack painted with canary pattern");
+  Serial.flush();
+#endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
@@ -314,6 +358,35 @@ void setup() {
   interface_manager.addInterface(InterfaceType::HardwareSerial, &hardware_serial_interface);
 #endif
 
+// add bitchat bridge, must be after the bluetooth interface has been started
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  bitchat_bridge = new BitchatBridge(the_mesh, the_mesh.self_id, the_mesh.getNodeName(),
+                                    the_mesh.getNodePrefs()->path_hash_mode);
+  if (bitchat_bridge == nullptr) {
+    Serial.println("ERROR: BitchatBridge allocation failed!");
+  } else {
+    bitchat_bridge->begin();
+  #if defined(BLE_PIN_CODE) && defined(ESP32)
+    // share the BLE server with the MeshCore companion interface
+    if (bluetooth_interface.getBLEServer() != nullptr
+          && bitchat_bridge->attachBLEService(bluetooth_interface.getBLEServer())) {
+      bluetooth_interface.setBitchatService(&bitchat_bridge->getBLEService());
+      Serial.println("Bitchat BLE service attached");
+    } else {
+      Serial.println("ERROR: Failed to attach Bitchat BLE service!");
+    }
+  #else
+    // no companion BLE interface, Bitchat owns the BLE stack
+    if (bitchat_bridge->beginStandalone(the_mesh.getNodeName())) {
+      Serial.println("Bitchat BLE service started (standalone mode)");
+    } else {
+      Serial.println("ERROR: Failed to start Bitchat BLE service!");
+    }
+  #endif
+    the_mesh.initBitchat(bitchat_bridge);
+  }
+#endif
+
   the_mesh.startInterface(interface_manager);
   sensors.begin();
 
@@ -363,11 +436,26 @@ void loop() {
   external_watchdog.loop();
 #endif
 
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  if (bitchat_bridge != nullptr) {
+    bitchat_bridge->loop();
+  }
+#endif
+
   if (!the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #endif
   }
+
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
+  // Print stack usage every 10 seconds for diagnostics
+  static uint32_t last_stack_print = 0;
+  if (millis() - last_stack_print >= 10000) {
+    print_stack_usage();
+    last_stack_print = millis();
+  }
+#endif
 
 #ifdef ENABLE_WIFI_INTERFACE
   if (wifi_enabled) {

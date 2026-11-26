@@ -128,3 +128,11 @@ void StaticPoolPacketManager::queueInbound(mesh::Packet* packet, uint32_t schedu
 mesh::Packet* StaticPoolPacketManager::getNextInbound(uint32_t now) {
   return rx_queue.get(now);
 }
+
+#if defined(NRF52_PLATFORM)
+// Static storage constructor for NRF52 - uses pre-allocated arrays instead of heap
+PacketQueue::PacketQueue(mesh::Packet** table, uint8_t* pri, uint32_t* sched, int size)
+    : _table(table), _pri_table(pri), _schedule_table(sched), _size(size), _num(0) {
+  // No allocations - using pre-allocated static storage
+}
+#endif

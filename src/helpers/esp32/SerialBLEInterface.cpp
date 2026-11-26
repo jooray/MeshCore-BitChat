@@ -1,6 +1,10 @@
 #include "SerialBLEInterface.h"
 #include "esp_mac.h"
 
+#ifdef ENABLE_BITCHAT
+#include "../bitchat/BitchatBLEService.h"
+#endif
+
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
 
@@ -95,6 +99,12 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+
+#ifdef ENABLE_BITCHAT
+  if (_bitchatService != nullptr) {
+    _bitchatService->onServerConnect();
+  }
+#endif
 }
 
 void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
@@ -107,6 +117,12 @@ void SerialBLEInterface::onDisconnect(BLEServer* pServer) {
   if (_isEnabled) {
     adv_restart_time = millis() + ADVERT_RESTART_DELAY;
   }
+
+#ifdef ENABLE_BITCHAT
+  if (_bitchatService != nullptr) {
+    _bitchatService->onServerDisconnect();
+  }
+#endif
 }
 
 // -------- BLECharacteristicCallbacks methods

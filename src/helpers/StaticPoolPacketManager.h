@@ -10,6 +10,11 @@ class PacketQueue {
 
 public:
   PacketQueue(int max_entries);
+
+#if defined(NRF52_PLATFORM)
+  // Static storage constructor for NRF52 - uses pre-allocated arrays instead of heap
+  PacketQueue(mesh::Packet** table, uint8_t* pri, uint32_t* sched, int size);
+#endif
   mesh::Packet* get(uint32_t now);
   bool add(mesh::Packet* packet, uint8_t priority, uint32_t scheduled_for);
   int count() const { return _num; }

@@ -6,6 +6,14 @@
 #endif
 #include <Mesh.h>
 
+#if defined(NRF52_PLATFORM)
+#include <helpers/nrf52/NRF52StaticPoolPacketManager.h>
+#endif
+
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+#include <helpers/bitchat/BitchatBridge.h>
+#endif
+
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
 #define CMD_SEND_CHANNEL_TXT_MSG      3
@@ -140,6 +148,16 @@
 #define ERR_CODE_ILLEGAL_ARG            6
 
 #define MAX_SIGN_DATA_LEN               (8 * 1024) // 8K
+
+// NRF52 uses static packet pool to avoid heap fragmentation
+// ESP32 and other platforms continue using heap allocation
+#if defined(NRF52_PLATFORM)
+static NRF52StaticPoolPacketManager g_nrf52PacketManager;
+
+mesh::PacketManager& getNRF52PacketManager() {
+  return g_nrf52PacketManager;
+}
+#endif
 
 // Auto-add config bitmask
 // Bit 0: If set, overwrite oldest non-favourite contact when contacts file is full
@@ -543,6 +561,34 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  Serial.println("MYMESH: onChannelMessageRecv called");
+  Serial.print("MYMESH: _bitchatBridge=");
+  Serial.println(_bitchatBridge != nullptr ? "valid" : "NULL");
+
+  // Forward to Bitchat bridge if available
+  if (_bitchatBridge != nullptr) {
+    // Text format is "sender: message" - extract sender and message
+    const char* colonPos = strchr(text, ':');
+    if (colonPos != nullptr && colonPos > text) {
+      char senderName[32];
+      size_t senderLen = colonPos - text;
+      if (senderLen >= sizeof(senderName)) senderLen = sizeof(senderName) - 1;
+      memcpy(senderName, text, senderLen);
+      senderName[senderLen] = '\0';
+
+      const char* msgText = colonPos + 1;
+      while (*msgText == ' ') msgText++;  // Skip leading space
+
+      _bitchatBridge->onMeshcoreGroupMessage(channel, timestamp, senderName, msgText);
+    } else {
+      // No colon found, use whole text
+      _bitchatBridge->onMeshcoreGroupMessage(channel, timestamp, "Unknown", text);
+    }
+    Serial.println("MYMESH: bitchat bridge call returned");
+  }
+#endif
+
   int i = 0;
   if (app_target_ver >= 3) {
     out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
@@ -582,6 +628,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     _listener->onChannelMessageRecv(pkt, channel_details, text);
     _listener->onQueueSizeChanged(offline_queue_len);
   }
+  Serial.println("MYMESH: onChannelMessageRecv COMPLETE");
 }
 
 void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint16_t data_type,
@@ -884,7 +931,11 @@ uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t
 void MyMesh::onSendTimeout() {}
 
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store)
-    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
+#if defined(NRF52_PLATFORM)
+    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, getNRF52PacketManager(), tables),  // NRF52: static pool to avoid heap fragmentation
+#else
+    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),  // Other platforms: heap allocation
+#endif
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _listener(NULL), _iter(0) {
   _iter_started = false;
   _cli_rescue = false;
@@ -898,6 +949,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   memset(advert_paths, 0, sizeof(advert_paths));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
+
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  _bitchatBridge = NULL;
+#endif
 
   // defaults
   _prefs.airtime_factor = 1.0;
@@ -2591,6 +2646,13 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
+  // Call bitchat loop FIRST - BaseChatMesh::loop() may block on serial/radio
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  if (_bitchatBridge != nullptr) {
+    _bitchatBridge->loop();
+  }
+#endif
+
   BaseChatMesh::loop();
 
   if (_cli_rescue) {
@@ -2611,6 +2673,11 @@ void MyMesh::loop() {
   }
 }
 
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+void MyMesh::initBitchat(BitchatBridge* bridge) {
+  _bitchatBridge = bridge;
+}
+#endif
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;

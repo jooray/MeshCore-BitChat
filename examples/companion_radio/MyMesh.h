@@ -70,6 +70,10 @@
 #include <helpers/TransportKeyStore.h>
 #include <helpers/MeshEventListener.h>
 
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+class BitchatBridge;  // Forward declaration
+#endif
+
 /* -------------------------------------------------------------------------------------- */
 
 #define REQ_TYPE_GET_STATUS             0x01 // same as _GET_STATS
@@ -96,6 +100,11 @@ public:
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
   void setBLEPin(uint32_t active_pin);
+
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  void initBitchat(BitchatBridge* bridge);
+  BitchatBridge* getBitchatBridge() { return _bitchatBridge; }
+#endif
 
   void loop();
   void handleCmdFrame(size_t len);
@@ -264,6 +273,10 @@ private:
 
   #define ADVERT_PATH_TABLE_SIZE   16
   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
+
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+  BitchatBridge* _bitchatBridge;
+#endif
 };
 
 extern MyMesh the_mesh;

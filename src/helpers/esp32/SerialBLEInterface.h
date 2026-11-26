@@ -8,6 +8,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+#ifdef ENABLE_BITCHAT
+class BitchatBLEService;
+#endif
+
 class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLEServerCallbacks, BLECharacteristicCallbacks {
   BLEServer *pServer;
   BLEService *pService;
@@ -85,6 +89,15 @@ public:
   bool isWriteBusy() const override;
   size_t writeFrame(const uint8_t src[], size_t len) override;
   size_t checkRecvFrame(uint8_t dest[]) override;
+
+  // Expose BLE server for adding additional services (e.g., Bitchat)
+  BLEServer* getBLEServer() { return pServer; }
+
+#ifdef ENABLE_BITCHAT
+  void setBitchatService(BitchatBLEService* service) { _bitchatService = service; }
+private:
+  BitchatBLEService* _bitchatService = nullptr;
+#endif
 };
 
 #if BLE_DEBUG_LOGGING && ARDUINO

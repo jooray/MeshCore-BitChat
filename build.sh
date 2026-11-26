@@ -15,6 +15,7 @@ Commands:
   build-firmwares: Build all firmwares for all targets.
   build-matching-firmwares <build-match-spec>: Build all firmwares for build targets containing the string given for <build-match-spec>.
   build-companion-firmwares: Build all companion firmwares for all build targets.
+  build-bitchat-firmwares: Build all Bitchat bridge firmwares.
   build-repeater-firmwares: Build all repeater firmwares for all build targets.
   build-room-server-firmwares: Build all chat room server firmwares for all build targets.
 
@@ -98,20 +99,21 @@ get_pio_envs_ending_with_string() {
 # get platform flag for a given environment
 # $1 should be the environment name
 get_platform_for_env() {
-  local env_name=$1
-  printf '%s' "$PIO_CONFIG_JSON" | python3 -c "
+  local env_name="$1"
+  printf '%s' "$PIO_CONFIG_JSON" | python3 -c '
 import sys, json, re
+env_name = sys.argv[1]
 data = json.load(sys.stdin)
 for section, options in data:
-    if section == 'env:$env_name':
+    if section == f"env:{env_name}":
         for key, value in options:
-            if key == 'build_flags':
+            if key == "build_flags":
                 for flag in value:
-                    match = re.search(r'(ESP32_PLATFORM|NRF52_PLATFORM|STM32_PLATFORM|RP2040_PLATFORM)', flag)
+                    match = re.search(r"(ESP32_PLATFORM|NRF52_PLATFORM|STM32_PLATFORM|RP2040_PLATFORM)", flag)
                     if match:
                         print(match.group(1))
                         sys.exit(0)
-"
+' "$env_name"
 }
 
 # disable all debug logging flags if DISABLE_DEBUG=1 is set
@@ -234,6 +236,10 @@ build_companion_firmwares() {
 
 }
 
+build_bitchat_firmwares() {
+  build_all_firmwares_matching "bitchat"
+}
+
 build_room_server_firmwares() {
 
 #  # build specific room server firmwares
@@ -288,6 +294,8 @@ elif [[ $1 == "build-firmwares" ]]; then
   build_firmwares
 elif [[ $1 == "build-companion-firmwares" ]]; then
   build_companion_firmwares
+elif [[ $1 == "build-bitchat-firmwares" ]]; then
+  build_bitchat_firmwares
 elif [[ $1 == "build-repeater-firmwares" ]]; then
   build_repeater_firmwares
 elif [[ $1 == "build-room-server-firmwares" ]]; then
