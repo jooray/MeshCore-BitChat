@@ -5,10 +5,10 @@
 #include <string.h>
 
 // Bitchat Protocol Constants
-#define BITCHAT_HEADER_SIZE 14  // v1: version(1) + type(1) + ttl(1) + timestamp(8) + flags(1) + payloadLength(2)
+#define BITCHAT_HEADER_SIZE 14     // v1: version(1) + type(1) + ttl(1) + timestamp(8) + flags(1) + payloadLength(2)
 #define BITCHAT_HEADER_SIZE_V2 16  // v2: same as v1 but payloadLength is 4 bytes
 #define BITCHAT_SIGNATURE_SIZE 64  // Ed25519 signature
-#define BITCHAT_MAX_WIRE_PAYLOAD_SIZE 245  // Max payload size on wire (compressed/padded)
+#define BITCHAT_MAX_WIRE_PAYLOAD_SIZE 245  // Legacy reference max wire payload
 // Max decompressed payload size - reduced on NRF52 to save RAM (1KB vs 2KB)
 #if defined(NRF52_PLATFORM)
   #define BITCHAT_MAX_PAYLOAD_SIZE 1024  // 1KB for NRF52 (saves 1KB RAM)
@@ -21,8 +21,7 @@
 #define BITCHAT_SENDER_ID_SIZE 8
 #define BITCHAT_RECIPIENT_ID_SIZE 8
 
-// Maximum message size on wire: header(13) + sender(8) + recipient(8) + payload(245) + signature(64) = 338 bytes
-#define BITCHAT_MAX_MESSAGE_SIZE (BITCHAT_HEADER_SIZE + BITCHAT_SENDER_ID_SIZE + BITCHAT_RECIPIENT_ID_SIZE + BITCHAT_MAX_WIRE_PAYLOAD_SIZE + BITCHAT_SIGNATURE_SIZE)
+#define BITCHAT_MAX_MESSAGE_SIZE 512
 
 // BLE Service UUIDs
 #define BITCHAT_SERVICE_UUID "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C"
@@ -59,16 +58,13 @@ enum BitchatMessageType : uint8_t {
 #define BITCHAT_FLAG_HAS_SIGNATURE 0x02
 #define BITCHAT_FLAG_IS_COMPRESSED 0x04
 #define BITCHAT_FLAG_HAS_ROUTE     0x08  // v2+ only: optional source route follows recipientID
+#define BITCHAT_FLAG_IS_RSR        0x10  // iOS; cleared in the signing preimage
 
 // Announce payload TLV types
 #define BITCHAT_TLV_NICKNAME 0x01
 #define BITCHAT_TLV_NOISE_PUBKEY 0x02
 #define BITCHAT_TLV_ED25519_PUBKEY 0x03
 
-/**
- * Bitchat Protocol Message Structure
- * Matches iOS BinaryProtocol format for compatibility
- */
 struct BitchatMessage {
     uint8_t version;
     uint8_t type;
@@ -82,11 +78,11 @@ struct BitchatMessage {
     uint8_t payload[BITCHAT_MAX_PAYLOAD_SIZE];
     uint8_t signature[BITCHAT_SIGNATURE_SIZE];
 
-    BitchatMessage() : version(BITCHAT_VERSION), type(0), ttl(0), timestamp(0), flags(0), payloadLength(0), wirePayloadLength(0) {
-        memset(senderId, 0, sizeof(senderId));
-        memset(recipientId, 0, sizeof(recipientId));
-        memset(payload, 0, sizeof(payload));
-        memset(signature, 0, sizeof(signature));
+    BitchatMessage() { clear(); }
+
+    void clear() {
+        memset(this, 0, sizeof(*this));
+        version = BITCHAT_VERSION;
     }
 
     bool hasRecipient() const { return (flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0; }
@@ -96,54 +92,35 @@ struct BitchatMessage {
     void setHasRecipient(bool val) { if (val) flags |= BITCHAT_FLAG_HAS_RECIPIENT; else flags &= ~BITCHAT_FLAG_HAS_RECIPIENT; }
     void setHasSignature(bool val) { if (val) flags |= BITCHAT_FLAG_HAS_SIGNATURE; else flags &= ~BITCHAT_FLAG_HAS_SIGNATURE; }
 
-    // Get sender ID as 64-bit integer (little-endian)
-    uint64_t getSenderId64() const {
+    uint64_t getSenderId64() const { return readLE64(senderId); }
+    void setSenderId64(uint64_t id) { writeLE64(senderId, id); }
+    uint64_t getRecipientId64() const { return readLE64(recipientId); }
+    void setRecipientId64(uint64_t id) { writeLE64(recipientId, id); }
+
+    static uint64_t readLE64(const uint8_t* p) {
         uint64_t id = 0;
         for (int i = 0; i < 8; i++) {
-            id |= (static_cast<uint64_t>(senderId[i]) << (i * 8));
+            id |= (static_cast<uint64_t>(p[i]) << (i * 8));
         }
         return id;
     }
 
-    // Set sender ID from 64-bit integer (little-endian)
-    void setSenderId64(uint64_t id) {
+    static void writeLE64(uint8_t* p, uint64_t id) {
         for (int i = 0; i < 8; i++) {
-            senderId[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
-        }
-    }
-
-    // Get recipient ID as 64-bit integer
-    uint64_t getRecipientId64() const {
-        uint64_t id = 0;
-        for (int i = 0; i < 8; i++) {
-            id |= (static_cast<uint64_t>(recipientId[i]) << (i * 8));
-        }
-        return id;
-    }
-
-    // Set recipient ID from 64-bit integer
-    void setRecipientId64(uint64_t id) {
-        for (int i = 0; i < 8; i++) {
-            recipientId[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
+            p[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
         }
     }
 };
 
 /**
- * Duplicate Message Cache
- * Prevents message loops by tracking recently seen messages
+ * Duplicate Message Cache (FNV-1a over sender, second, type, length and full payload)
  */
 class BitchatDuplicateCache {
 public:
     BitchatDuplicateCache();
 
-    // Check if message is a duplicate (and add if not)
     bool isDuplicate(const BitchatMessage& msg);
-
-    // Explicitly add a message to the cache
     void addMessage(const BitchatMessage& msg);
-
-    // Clear the cache
     void clear();
 
 private:
@@ -158,104 +135,32 @@ private:
     CacheEntry cache[BITCHAT_DUPLICATE_CACHE_SIZE];
     size_t currentIndex;
 
-    // FNV-1a hash
     uint32_t calculateHash(const BitchatMessage& msg) const;
 };
 
-/**
- * Protocol parsing and serialization
- */
 class BitchatProtocol {
 public:
-    /**
-     * Parse a binary buffer into a BitchatMessage
-     * @param data Input buffer
-     * @param length Buffer length
-     * @param msg Output message
-     * @return true if parsing succeeded
-     */
     static bool parseMessage(const uint8_t* data, size_t length, BitchatMessage& msg);
-
-    /**
-     * Serialize a BitchatMessage to a binary buffer
-     * @param msg Input message
-     * @param buffer Output buffer
-     * @param maxLength Buffer capacity
-     * @return Number of bytes written, or 0 on failure
-     */
     static size_t serializeMessage(const BitchatMessage& msg, uint8_t* buffer, size_t maxLength);
-
-    /**
-     * Validate a BitchatMessage
-     * @param msg Message to validate
-     * @return true if message is valid
-     */
     static bool validateMessage(const BitchatMessage& msg);
-
-    /**
-     * Get the serialized size of a message
-     * @param msg Message to measure
-     * @return Size in bytes
-     */
+    static int frameLength(const uint8_t* data, size_t length);
     static size_t getMessageSize(const BitchatMessage& msg);
-
-    /**
-     * Compute the deterministic packet ID for a message
-     * This matches the Android Bitchat packet ID computation:
-     * SHA-256(type | senderId | timestamp_BE | payload)[0:16]
-     *
-     * @param msg Message to compute ID for
-     * @param outId16 Output buffer (16 bytes) for the packet ID
-     */
     static void computePacketId(const BitchatMessage& msg, uint8_t* outId16);
+    static size_t applyPKCS7Padding(uint8_t* buffer, size_t dataLen, size_t capacity);
+    static size_t signingPreimage(const BitchatMessage& msg, uint8_t* buffer, size_t maxLength);
 
-    /**
-     * Create an ANNOUNCE message
-     * @param msg Output message
-     * @param senderId Sender's 64-bit ID
-     * @param nickname Sender's nickname (null-terminated)
-     * @param noisePublicKey Curve25519 public key for Noise protocol (32 bytes, can be NULL)
-     * @param signingPublicKey Ed25519 public key for signatures (32 bytes, can be NULL)
-     * @param timestamp Current time in milliseconds
-     * @param ttl Time-to-live
-     */
     static void createAnnounce(BitchatMessage& msg, uint64_t senderId, const char* nickname,
                                const uint8_t* noisePublicKey, const uint8_t* signingPublicKey,
                                uint64_t timestamp, uint8_t ttl);
+    static const uint8_t* findTLV(const uint8_t* payload, size_t len, uint8_t type, uint8_t* outLen);
 
-    /**
-     * Create a MESSAGE (text message)
-     * @param msg Output message
-     * @param senderId Sender's 64-bit ID
-     * @param recipientId Recipient's 64-bit ID (0 for channel message)
-     * @param channelName Channel name (for channel messages, without #)
-     * @param text Message text
-     * @param textLen Text length
-     * @param timestamp Current time in milliseconds
-     * @param ttl Time-to-live
-     */
-    static void createTextMessage(BitchatMessage& msg, uint64_t senderId, uint64_t recipientId,
-                                  const char* channelName, const char* text, size_t textLen,
-                                  uint64_t timestamp, uint8_t ttl);
-
-    /**
-     * Decompress a message payload in-place
-     * Use this after fragment reassembly when the IS_COMPRESSED flag is set.
-     * @param msg Message with compressed payload - will be modified in-place
-     * @return true if decompression succeeded (or wasn't needed), false on error
-     */
+    static int inflatePayload(const uint8_t* in, size_t inLen, uint8_t* out, size_t outCap,
+                              uint8_t version = BITCHAT_VERSION);
     static bool decompressPayload(BitchatMessage& msg);
 
-private:
-    // Read big-endian uint16
     static uint16_t readBE16(const uint8_t* data);
-
-    // Read big-endian uint64
+    static uint32_t readBE32(const uint8_t* data);
     static uint64_t readBE64(const uint8_t* data);
-
-    // Write big-endian uint16
     static void writeBE16(uint8_t* data, uint16_t value);
-
-    // Write big-endian uint64
     static void writeBE64(uint8_t* data, uint64_t value);
 };

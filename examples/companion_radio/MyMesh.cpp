@@ -6,7 +6,7 @@
 #endif
 #include <Mesh.h>
 
-#if defined(NRF52_PLATFORM)
+#if defined(NRF52_PLATFORM) && defined(ENABLE_BITCHAT)
 #include <helpers/nrf52/NRF52StaticPoolPacketManager.h>
 #endif
 
@@ -150,9 +150,8 @@
 
 #define MAX_SIGN_DATA_LEN               (8 * 1024) // 8K
 
-// NRF52 uses static packet pool to avoid heap fragmentation
-// ESP32 and other platforms continue using heap allocation
-#if defined(NRF52_PLATFORM)
+// NRF52 Bitchat uses static packet pool to avoid heap fragmentation
+#if defined(NRF52_PLATFORM) && defined(ENABLE_BITCHAT)
 static NRF52StaticPoolPacketManager g_nrf52PacketManager;
 
 mesh::PacketManager& getNRF52PacketManager() {
@@ -560,6 +559,28 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
   queueMessage(from, TXT_TYPE_SIGNED_PLAIN, pkt, sender_timestamp, sender_prefix, 4, text);
 }
 
+#if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches) {
+  int n = BaseChatMesh::searchChannelsByHash(hash, dest, max_matches);
+  if (_bitchatBridge != nullptr && n < max_matches) {
+    const mesh::GroupChannel& mc = _bitchatBridge->getMeshChannel();
+    if (mc.hash[0] == hash[0]) {
+      bool found = false;
+      for (int i = 0; i < n; i++) {
+        if (memcmp(dest[i].secret, mc.secret, sizeof(mc.secret)) == 0) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        dest[n++] = mc;
+      }
+    }
+  }
+  return n;
+}
+#endif
+
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
 #if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
@@ -590,6 +611,12 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   }
 #endif
 
+  int found_idx = findChannelIdx(channel);
+  if (found_idx < 0) {
+    return;  // Decrypted only for the bridge; not in user's channel table
+  }
+  uint8_t channel_idx = (uint8_t)found_idx;
+
   int i = 0;
   if (app_target_ver >= 3) {
     out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
@@ -600,7 +627,6 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV;
   }
 
-  uint8_t channel_idx = findChannelIdx(channel);
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
 
@@ -629,11 +655,17 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     _listener->onChannelMessageRecv(pkt, channel_details, text);
     _listener->onQueueSizeChanged(offline_queue_len);
   }
+#ifdef ENABLE_BITCHAT
   BITCHAT_SERIAL.println("MYMESH: onChannelMessageRecv COMPLETE");
+#endif
 }
 
 void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint16_t data_type,
                                const uint8_t *data, size_t data_len) {
+  int found_idx = findChannelIdx(channel);
+  if (found_idx < 0) {
+    return;
+  }
   if (data_len > MAX_CHANNEL_DATA_LENGTH) {
     MESH_DEBUG_PRINTLN("onChannelDataRecv: dropping payload_len=%d exceeds frame limit=%d",
                        (uint32_t)data_len, (uint32_t)MAX_CHANNEL_DATA_LENGTH);
@@ -646,7 +678,7 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
   out_frame[i++] = 0; // reserved1
   out_frame[i++] = 0; // reserved2
 
-  uint8_t channel_idx = findChannelIdx(channel);
+  uint8_t channel_idx = (uint8_t)found_idx;
   out_frame[i++] = channel_idx;
   out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   out_frame[i++] = (uint8_t)(data_type & 0xFF);
@@ -932,10 +964,10 @@ uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t
 void MyMesh::onSendTimeout() {}
 
 MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store)
-#if defined(NRF52_PLATFORM)
-    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, getNRF52PacketManager(), tables),  // NRF52: static pool to avoid heap fragmentation
+#if defined(NRF52_PLATFORM) && defined(ENABLE_BITCHAT)
+    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, getNRF52PacketManager(), tables),  // NRF52 Bitchat: static pool to avoid heap fragmentation
 #else
-    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),  // Other platforms: heap allocation
+    : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
 #endif
       _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _listener(NULL), _iter(0) {
   _iter_started = false;
@@ -1919,7 +1951,8 @@ void MyMesh::handleCmdFrame(size_t len) {
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
       bool success = false;
-      if (strcmp(sp, "bitchat_region") == 0 && strlen(np) < sizeof(_prefs.bitchat_region)) {
+      if (strcmp(sp, "bitchat_region") == 0 && strlen(np) < sizeof(_prefs.bitchat_region) &&
+          strchr(np, ',') == nullptr && strchr(np, ':') == nullptr) {
         strcpy(_prefs.bitchat_region, np);
         savePrefs();
         success = true;

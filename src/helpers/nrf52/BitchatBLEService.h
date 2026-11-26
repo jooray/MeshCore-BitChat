@@ -1,90 +1,39 @@
 #pragma once
 
-#ifdef NRF52_PLATFORM
+#if defined(NRF52_PLATFORM) && defined(ENABLE_BITCHAT)
 
 #include "../bitchat/BitchatProtocol.h"
 #include <bluefruit.h>
 
-/**
- * Callback interface for Bitchat BLE events
- */
+#define BITCHAT_BLE_RX_MAX 514
+
 class BitchatBLECallback {
 public:
     virtual ~BitchatBLECallback() {}
-
-    /**
-     * Called when a Bitchat message is received via BLE
-     * @param msg The received message
-     */
-    virtual void onBitchatMessageReceived(const BitchatMessage& msg) = 0;
-
-    /**
-     * Called when a Bitchat BLE client connects
-     */
+    virtual void onBitchatRawPacket(const uint8_t* data, size_t len) = 0;
     virtual void onBitchatClientConnect() {}
-
-    /**
-     * Called when a Bitchat BLE client disconnects
-     */
     virtual void onBitchatClientDisconnect() {}
+    virtual void onBitchatClientSubscribed() {}
 };
 
-/**
- * Bitchat BLE Service for NRF52 (using Bluefruit)
- * Provides a GATT service for Bitchat protocol communication
- *
- * Note: This uses standalone BLE advertising. For NRF52, when Bitchat is enabled,
- * the MeshCore companion uses USB serial while Bitchat uses BLE independently.
- */
 class BitchatBLEService {
 public:
     BitchatBLEService();
 
-    /**
-     * Initialize BLE and start the Bitchat service in standalone mode
-     * Creates BLE server with Bitchat service only.
-     * @param deviceName BLE device name for advertising
-     * @param callback Callback for Bitchat events
-     * @return true if successful
-     */
     bool beginStandalone(const char* deviceName, BitchatBLECallback* callback);
-
-    /**
-     * Start BLE advertising
-     * Call after beginStandalone() to start advertising
-     */
     void startAdvertising();
 
-    /**
-     * Check if the service is active
-     */
     bool isActive() const { return _serviceActive; }
+    bool hasConnectedClient() const {
+        return __atomic_load_n(&_bitchatClientCount, __ATOMIC_ACQUIRE) > 0;
+    }
 
-    /**
-     * Check if a Bitchat client is connected
-     */
-    bool hasConnectedClient() const { return _bitchatClientCount > 0; }
-
-    /**
-     * Broadcast a message to connected Bitchat clients
-     * @param msg Message to send
-     * @return true if message was sent
-     */
     bool broadcastMessage(const BitchatMessage& msg);
-
-    /**
-     * Process loop - call from main loop
-     * Handles deferred message processing
-     */
+    bool broadcastRaw(const uint8_t* data, size_t len);
     void loop();
-
-    /**
-     * Called when a client disconnects
-     */
     void onServerDisconnect();
 
 private:
-    // Bluefruit service and characteristic
     BLEService _service;
     BLECharacteristic _characteristic;
     BitchatBLECallback* _callback;
@@ -93,49 +42,43 @@ private:
     bool _serviceActive;
     uint8_t _bitchatClientCount;
     bool _clientSubscribed;
+    bool _pendingConnect;
+    bool _pendingDisconnect;
+    bool _pendingSubscribe;
 
-    // Flags for deferred processing
-    volatile bool _pendingConnect;
-    volatile bool _pendingData;
-
-    // Write buffer for reassembling fragmented BLE writes
-    // 1024 bytes to handle long messages that compress to ~615 bytes (2 fragments)
-    // Made static to keep 1KB out of heap allocation
-    static uint8_t _writeBuffer[1024];
-    size_t _writeBufferOffset;
-    uint32_t _lastWriteTime;
-    static const uint32_t WRITE_TIMEOUT_MS = 5000;
-
-    // Message queue for deferred processing (incoming)
-    // Reduced from 8 to 2 to save ~13KB heap (each BitchatMessage is ~2KB)
-    static const size_t MESSAGE_QUEUE_SIZE = 2;
-    struct QueuedMessage {
-        BitchatMessage msg;
-        bool valid;
+    // Static SPSC raw packet ring: SoftDevice callback produces, loop() consumes
+    static const size_t RX_RING_DEPTH = 4;
+    struct RxSlot {
+        uint16_t len;
+        uint8_t data[BITCHAT_BLE_RX_MAX];
     };
-    // Static to keep out of heap allocation
-    static QueuedMessage _messageQueue[MESSAGE_QUEUE_SIZE];
-    volatile size_t _queueHead;
-    volatile size_t _queueTail;
+    static RxSlot _rxRing[RX_RING_DEPTH];
+    uint32_t _rxHead;
+    uint32_t _rxTail;
 
-    // Pending outgoing message (when client not yet subscribed)
-    // Made static to keep ~2KB out of heap allocation
-    static BitchatMessage _pendingOutgoing;
-    bool _hasPendingOutgoing;
+    // Static TX queue so REQUEST_SYNC bursts (up to 8 packets + ANNOUNCE) survive
+    // SoftDevice HVN buffer exhaustion (NRF_ERROR_RESOURCES) with retry in loop()
+    static const size_t TX_RING_DEPTH = 10;
+    static const size_t TX_SLOT_SIZE = 256;
+    static const uint32_t TX_GIVE_UP_MS = 2000;
+    struct TxSlot {
+        uint16_t len;
+        uint8_t data[TX_SLOT_SIZE];
+    };
+    static TxSlot _txRing[TX_RING_DEPTH];
+    size_t _txHead;
+    size_t _txCount;
+    uint32_t _txStartedMs;
+    bool _txInFlight;
 
-    void clearWriteBuffer();
-    bool queueMessage(const BitchatMessage& msg);
-    void processQueue();
-    void sendPendingOutgoing();
+    void drainTxQueue();
 
-    // Static callbacks for Bluefruit (will call instance methods)
     static void onConnect(uint16_t conn_handle);
     static void onDisconnect(uint16_t conn_handle, uint8_t reason);
     static void onCharacteristicWrite(uint16_t conn_handle, BLECharacteristic* chr, uint8_t* data, uint16_t len);
     static void onCharacteristicCccdWrite(uint16_t conn_handle, BLECharacteristic* chr, uint16_t cccd_value);
 
-    // Singleton for static callback access
     static BitchatBLEService* _instance;
 };
 
-#endif // NRF52_PLATFORM
+#endif // NRF52_PLATFORM && ENABLE_BITCHAT

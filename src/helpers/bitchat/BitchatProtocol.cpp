@@ -1,27 +1,23 @@
 #include "BitchatProtocol.h"
 #include "BitchatDebugSerial.h"
-#include "BitchatBridge.h"  // For shared decompression buffers
 #include "../../Utils.h"
 
-// Platform-specific miniz includes for DEFLATE decompression
 #if defined(ESP32)
-  #include <Arduino.h>  // For Serial debug output
-  // Use ESP-IDF's ROM miniz for raw deflate decompression
-  // tinfl_decompress_mem_to_mem() is available in ESP32 ROM
+  #include <Arduino.h>
   extern "C" {
   #include "rom/miniz.h"
   }
   #define BITCHAT_HAS_DECOMPRESSION 1
 #elif defined(NRF52_PLATFORM)
-  // NRF52: Decompression DISABLED due to heap constraints
-  // The SoftDevice BLE stack + miniz decompressor (~10KB) exhausts heap
-  // Long/compressed messages will be rejected on NRF52
-  // See CLAUDE.md "NRF52 Bitchat Limitations" for details
-  #define BITCHAT_HAS_DECOMPRESSION 0
+  #include "BitchatBridge.h"  // For shared static decompression buffers on NRF52
+  #include "../miniz/miniz_tinfl.h"
+  #define BITCHAT_HAS_DECOMPRESSION 1
 #else
-  // No decompression support on other platforms
-  #define BITCHAT_HAS_DECOMPRESSION 0
+  #include "../miniz/miniz_tinfl.h"
+  #define BITCHAT_HAS_DECOMPRESSION 1
 #endif
+
+#define BITCHAT_MAX_COMPRESSED_WIRE_PAYLOAD 2048
 
 // ============================================================================
 // BitchatDuplicateCache
@@ -41,39 +37,30 @@ void BitchatDuplicateCache::clear() {
 }
 
 uint32_t BitchatDuplicateCache::calculateHash(const BitchatMessage& msg) const {
-    // FNV-1a hash algorithm
-    uint32_t hash = 2166136261u;  // FNV offset basis
+    uint32_t hash = 2166136261u;
 
-    // Hash sender ID
     for (int i = 0; i < BITCHAT_SENDER_ID_SIZE; i++) {
         hash ^= msg.senderId[i];
-        hash *= 16777619u;  // FNV prime
+        hash *= 16777619u;
     }
 
-    // Hash timestamp (lower 32 bits, in seconds for tolerance)
     uint32_t ts_sec = static_cast<uint32_t>(msg.timestamp / 1000);
-    hash ^= (ts_sec & 0xFF);
-    hash *= 16777619u;
-    hash ^= ((ts_sec >> 8) & 0xFF);
-    hash *= 16777619u;
-    hash ^= ((ts_sec >> 16) & 0xFF);
-    hash *= 16777619u;
-    hash ^= ((ts_sec >> 24) & 0xFF);
-    hash *= 16777619u;
+    for (int i = 0; i < 4; i++) {
+        hash ^= ((ts_sec >> (8 * i)) & 0xFF);
+        hash *= 16777619u;
+    }
 
-    // Hash message type
     hash ^= msg.type;
     hash *= 16777619u;
 
-    // Hash payload length
     hash ^= (msg.payloadLength & 0xFF);
     hash *= 16777619u;
     hash ^= ((msg.payloadLength >> 8) & 0xFF);
     hash *= 16777619u;
 
-    // Hash first 16 bytes of payload (if available)
-    size_t hashLen = msg.payloadLength < 16 ? msg.payloadLength : 16;
-    for (size_t i = 0; i < hashLen; i++) {
+    // Hash full decoded payload (matches upstream apps and avoids prefix collisions)
+    size_t n = msg.payloadLength <= BITCHAT_MAX_PAYLOAD_SIZE ? msg.payloadLength : BITCHAT_MAX_PAYLOAD_SIZE;
+    for (size_t i = 0; i < n; i++) {
         hash ^= msg.payload[i];
         hash *= 16777619u;
     }
@@ -85,12 +72,9 @@ bool BitchatDuplicateCache::isDuplicate(const BitchatMessage& msg) {
     uint32_t hash = calculateHash(msg);
     uint32_t ts_sec = static_cast<uint32_t>(msg.timestamp / 1000);
 
-    // Check existing entries
     for (size_t i = 0; i < BITCHAT_DUPLICATE_CACHE_SIZE; i++) {
         if (!cache[i].valid) continue;
-
         if (cache[i].hash == hash) {
-            // Allow ±5 second timestamp tolerance for duplicates
             int32_t timeDiff = static_cast<int32_t>(ts_sec) - static_cast<int32_t>(cache[i].timestamp);
             if (timeDiff >= -5 && timeDiff <= 5) {
                 return true;
@@ -98,7 +82,6 @@ bool BitchatDuplicateCache::isDuplicate(const BitchatMessage& msg) {
         }
     }
 
-    // Not a duplicate - add to cache
     addMessage(msg);
     return false;
 }
@@ -107,16 +90,22 @@ void BitchatDuplicateCache::addMessage(const BitchatMessage& msg) {
     cache[currentIndex].hash = calculateHash(msg);
     cache[currentIndex].timestamp = static_cast<uint32_t>(msg.timestamp / 1000);
     cache[currentIndex].valid = true;
-
     currentIndex = (currentIndex + 1) % BITCHAT_DUPLICATE_CACHE_SIZE;
 }
 
 // ============================================================================
-// BitchatProtocol - Helper functions
+// Big-endian helpers
 // ============================================================================
 
 uint16_t BitchatProtocol::readBE16(const uint8_t* data) {
     return (static_cast<uint16_t>(data[0]) << 8) | data[1];
+}
+
+uint32_t BitchatProtocol::readBE32(const uint8_t* data) {
+    return (static_cast<uint32_t>(data[0]) << 24) |
+           (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) |
+           static_cast<uint32_t>(data[3]);
 }
 
 uint64_t BitchatProtocol::readBE64(const uint8_t* data) {
@@ -139,21 +128,106 @@ void BitchatProtocol::writeBE64(uint8_t* data, uint64_t value) {
 }
 
 // ============================================================================
-// BitchatProtocol - Parsing and Serialization
+// Inflate
 // ============================================================================
 
-bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMessage& msg) {
-    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage ENTRY len=%u\n", (unsigned)length);
-    BITCHAT_SERIAL.flush();
+int BitchatProtocol::inflatePayload(const uint8_t* in, size_t inLen, uint8_t* out, size_t outCap,
+                                    uint8_t version) {
+#if BITCHAT_HAS_DECOMPRESSION
+    size_t prefixLen = (version >= BITCHAT_VERSION_2) ? 4 : 2;
+    if (inLen <= prefixLen) return -1;
 
-    if (length < BITCHAT_HEADER_SIZE) {
-        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for header");
-        return false;
+    uint32_t originalSize = (version >= BITCHAT_VERSION_2) ? readBE32(in) : readBE16(in);
+    if (originalSize == 0 || originalSize > outCap) return -1;
+
+    const uint8_t* src = in + prefixLen;
+    size_t srcLen = inLen - prefixLen;
+
+#if defined(NRF52_PLATFORM)
+    tinfl_decompressor* decomp = BitchatBridge::getDecompressor();
+    if (decomp == nullptr) return -1;
+#else
+    static tinfl_decompressor s_decomp;
+    tinfl_decompressor* decomp = &s_decomp;
+#endif
+
+    static const int attempts[2] = {
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | TINFL_FLAG_PARSE_ZLIB_HEADER
+    };
+
+    int result = -1;
+    for (int a = 0; a < 2; a++) {
+        size_t inBytes = srcLen;
+        size_t outBytes = outCap;
+        tinfl_init(decomp);
+        tinfl_status status = tinfl_decompress(decomp, src, &inBytes, out, out, &outBytes, attempts[a]);
+        if (status == TINFL_STATUS_DONE && outBytes == originalSize) {
+            result = static_cast<int>(outBytes);
+            break;
+        }
     }
 
-    size_t offset = 0;
+    return result;
+#else
+    (void)in; (void)inLen; (void)out; (void)outCap; (void)version;
+    return -1;
+#endif
+}
 
-    // Parse header (v1: 2-byte payloadLength / 14-byte header; v2: 4-byte payloadLength / 16-byte header)
+bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
+    if (!msg.isCompressed()) return true;
+#if defined(NRF52_PLATFORM)
+    uint8_t* tmp = BitchatBridge::getDecompBuffer();
+    if (tmp == nullptr) return false;
+#else
+    static uint8_t s_tmp[BITCHAT_MAX_PAYLOAD_SIZE];
+    uint8_t* tmp = s_tmp;
+#endif
+    int n = inflatePayload(msg.payload, msg.payloadLength, tmp, BITCHAT_MAX_PAYLOAD_SIZE, msg.version);
+    if (n >= 0) {
+        memcpy(msg.payload, tmp, static_cast<size_t>(n));
+        msg.payloadLength = static_cast<uint16_t>(n);
+        msg.flags &= ~BITCHAT_FLAG_IS_COMPRESSED;
+    }
+    return n >= 0;
+}
+
+// ============================================================================
+// Parsing and Serialization
+// ============================================================================
+
+int BitchatProtocol::frameLength(const uint8_t* data, size_t length) {
+    if (length < BITCHAT_HEADER_SIZE) return 0;
+    uint8_t version = data[0];
+    if (version < 1 || version > BITCHAT_VERSION_MAX) return -1;
+    uint8_t flags = data[11];
+    size_t header = BITCHAT_HEADER_SIZE;
+    uint32_t payloadLen;
+    if (version >= BITCHAT_VERSION_2) {
+        if (length < BITCHAT_HEADER_SIZE_V2) return 0;
+        payloadLen = readBE32(&data[12]);
+        header = BITCHAT_HEADER_SIZE_V2;
+    } else {
+        payloadLen = readBE16(&data[12]);
+    }
+    if (payloadLen > BITCHAT_MAX_COMPRESSED_WIRE_PAYLOAD) return -1;
+    size_t need = header + BITCHAT_SENDER_ID_SIZE + payloadLen;
+    if (flags & BITCHAT_FLAG_HAS_RECIPIENT) need += BITCHAT_RECIPIENT_ID_SIZE;
+    if (flags & BITCHAT_FLAG_HAS_SIGNATURE) need += BITCHAT_SIGNATURE_SIZE;
+    if (version >= BITCHAT_VERSION_2 && (flags & BITCHAT_FLAG_HAS_ROUTE)) {
+        size_t routeAt = header + BITCHAT_SENDER_ID_SIZE +
+                         ((flags & BITCHAT_FLAG_HAS_RECIPIENT) ? BITCHAT_RECIPIENT_ID_SIZE : 0);
+        if (length <= routeAt) return static_cast<int>(routeAt + 1);
+        need += 1 + static_cast<size_t>(data[routeAt]) * BITCHAT_SENDER_ID_SIZE;
+    }
+    return static_cast<int>(need);
+}
+
+bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMessage& msg) {
+    if (length < BITCHAT_HEADER_SIZE) return false;
+
+    size_t offset = 0;
     msg.version = data[offset++];
     msg.type = data[offset++];
     msg.ttl = data[offset++];
@@ -161,287 +235,96 @@ bool BitchatProtocol::parseMessage(const uint8_t* data, size_t length, BitchatMe
     offset += 8;
     msg.flags = data[offset++];
 
+    if (msg.version < 1 || msg.version > BITCHAT_VERSION_MAX) return false;
+
     uint32_t payloadLen;
     if (msg.version >= BITCHAT_VERSION_2) {
-        if (length < BITCHAT_HEADER_SIZE_V2) {
-            BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - too short for v2 header");
-            return false;
-        }
-        payloadLen = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16)
-                   | ((uint32_t)data[offset + 2] << 8) | (uint32_t)data[offset + 3];
+        if (length < BITCHAT_HEADER_SIZE_V2) return false;
+        payloadLen = readBE32(&data[offset]);
         offset += 4;
     } else {
         payloadLen = readBE16(&data[offset]);
         offset += 2;
     }
-    // Our buffers index payload length as 16-bit; the bridge only handles small #mesh text,
-    // so reject any (v2) payload that wouldn't fit rather than truncating silently.
-    if (payloadLen > 0xFFFF) {
-        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen too large");
-        return false;
-    }
-    msg.payloadLength = (uint16_t)payloadLen;
-    msg.wirePayloadLength = msg.payloadLength;  // Store original wire length before decompression
 
-    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage HEADER: ver=%u type=0x%02X ttl=%u flags=0x%02X payloadLen=%u\n",
-                  msg.version, msg.type, msg.ttl, msg.flags, msg.payloadLength);
-    BITCHAT_SERIAL.flush();
+    size_t maxPayload = msg.isCompressed() ? BITCHAT_MAX_COMPRESSED_WIRE_PAYLOAD : BITCHAT_MAX_PAYLOAD_SIZE;
+    if (payloadLen > maxPayload) return false;
+    msg.payloadLength = static_cast<uint16_t>(payloadLen);
+    msg.wirePayloadLength = msg.payloadLength;
 
-    // Validate version (we can parse v1 and v2)
-    if (msg.version < 1 || msg.version > BITCHAT_VERSION_MAX) {
-        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage FAIL - bad version %u (max %u)\n",
-                      msg.version, BITCHAT_VERSION_MAX);
-        return false;
-    }
+    size_t expectedSize = offset + BITCHAT_SENDER_ID_SIZE + payloadLen;
+    if (msg.hasRecipient()) expectedSize += BITCHAT_RECIPIENT_ID_SIZE;
+    if (msg.hasSignature()) expectedSize += BITCHAT_SIGNATURE_SIZE;
+    if (length < expectedSize) return false;
 
-    // Validate payload length
-    // For compressed messages, the wire payload can exceed BITCHAT_MAX_PAYLOAD_SIZE
-    // (e.g., 615 bytes compressed that decompress to <512 bytes)
-    // The decompressed size is checked separately during decompression
-    bool isCompressed = (msg.flags & BITCHAT_FLAG_IS_COMPRESSED) != 0;
-    const size_t MAX_COMPRESSED_WIRE_PAYLOAD = 2048;  // Max compressed payload on wire
-    size_t maxPayload = isCompressed ? MAX_COMPRESSED_WIRE_PAYLOAD : BITCHAT_MAX_PAYLOAD_SIZE;
-    if (msg.payloadLength > maxPayload) {
-        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage FAIL - payloadLen %u > max %u\n",
-                      msg.payloadLength, (unsigned)maxPayload);
-        return false;
-    }
-
-    // Calculate expected (minimum) message size. v2 has a 16-byte header; the optional v2
-    // source route is variable and validated separately below.
-    size_t headerSize = (msg.version >= BITCHAT_VERSION_2) ? BITCHAT_HEADER_SIZE_V2 : BITCHAT_HEADER_SIZE;
-    size_t expectedSize = headerSize + BITCHAT_SENDER_ID_SIZE;
-    if (msg.hasRecipient()) {
-        expectedSize += BITCHAT_RECIPIENT_ID_SIZE;
-    }
-    expectedSize += msg.payloadLength;
-    if (msg.hasSignature()) {
-        expectedSize += BITCHAT_SIGNATURE_SIZE;
-    }
-
-    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage expectedSize=%u, have=%u\n",
-                  (unsigned)expectedSize, (unsigned)length);
-
-    if (length < expectedSize) {
-        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: parseMessage FAIL - not enough data");
-        return false;
-    }
-
-    // Parse sender ID
     memcpy(msg.senderId, &data[offset], BITCHAT_SENDER_ID_SIZE);
     offset += BITCHAT_SENDER_ID_SIZE;
 
-    // Parse recipient ID (if present)
     memset(msg.recipientId, 0, BITCHAT_RECIPIENT_ID_SIZE);
     if (msg.hasRecipient()) {
         memcpy(msg.recipientId, &data[offset], BITCHAT_RECIPIENT_ID_SIZE);
         offset += BITCHAT_RECIPIENT_ID_SIZE;
     }
 
-    // Skip optional v2 source route (HAS_ROUTE): 1-byte hop count + count*8-byte peer IDs.
-    // The bridge doesn't route, so we just advance past it. It sits between recipientID and payload.
     if (msg.version >= BITCHAT_VERSION_2 && (msg.flags & BITCHAT_FLAG_HAS_ROUTE)) {
-        if (offset >= length) {
-            return false;
-        }
-        uint8_t routeCount = data[offset];
-        size_t routeBytes = 1 + (size_t)routeCount * BITCHAT_SENDER_ID_SIZE;
-        if (length < expectedSize + routeBytes) {
-            return false;  // route bytes are extra, on top of the minimum size
-        }
+        if (offset >= length) return false;
+        size_t routeBytes = 1 + static_cast<size_t>(data[offset]) * BITCHAT_SENDER_ID_SIZE;
+        if (length < expectedSize + routeBytes) return false;
         offset += routeBytes;
     }
 
-    // Parse payload
-    memset(msg.payload, 0, BITCHAT_MAX_PAYLOAD_SIZE);
-    uint16_t wirePayloadLength = msg.payloadLength;  // Save original wire length
-    if (wirePayloadLength > 0) {
-        // Check if payload is compressed
-        // NOTE: FRAGMENT packets may inherit the compressed flag but contain raw
-        // fragment data (not compressed). Skip decompression for fragment types.
-        bool isFragmentType = (msg.type == BITCHAT_MSG_FRAGMENT ||
-                               msg.type == BITCHAT_MSG_FRAGMENT_NEW);
+    memset(msg.payload, 0, sizeof(msg.payload));
+    if (payloadLen > 0) {
+        bool isFragmentType = (msg.type == BITCHAT_MSG_FRAGMENT || msg.type == BITCHAT_MSG_FRAGMENT_NEW);
         if (msg.isCompressed() && !isFragmentType) {
-#if BITCHAT_HAS_DECOMPRESSION
-            BITCHAT_SERIAL.println("PARSE: Compressed payload detected");
-            BITCHAT_SERIAL.flush();
-
-            // Compressed payload format (from Android CompressionUtil.kt):
-            // - First 2 bytes: original uncompressed size (big-endian)
-            // - Remaining bytes: raw deflate compressed data
-            if (wirePayloadLength < 3) {
-                BITCHAT_SERIAL.println("PARSE: Compressed payload too short");
-                return false;
-            }
-
-            // Read original size from first 2 bytes
-            uint16_t originalSize = (data[offset] << 8) | data[offset + 1];
-            const uint8_t* compressedData = &data[offset + 2];
-            size_t compressedLen = wirePayloadLength - 2;
-
-            BITCHAT_SERIAL.printf("PARSE: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
-            BITCHAT_SERIAL.flush();
-
-            if (originalSize > BITCHAT_MAX_PAYLOAD_SIZE) {
-                BITCHAT_SERIAL.printf("PARSE: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
-                return false;
-            }
-
-            // ESP32: Use malloc for decompression buffers (has plenty of heap and ROM miniz)
-            BITCHAT_SERIAL.printf("PARSE: malloc decompressor (%u bytes)...\n", (unsigned)sizeof(tinfl_decompressor));
-            BITCHAT_SERIAL.flush();
-            tinfl_decompressor* decomp = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
-            BITCHAT_SERIAL.printf("PARSE: malloc buffer (%u bytes)...\n", BITCHAT_MAX_PAYLOAD_SIZE);
-            BITCHAT_SERIAL.flush();
-            uint8_t* decompBuffer = (uint8_t*)malloc(BITCHAT_MAX_PAYLOAD_SIZE);
-
-            if (decomp == nullptr || decompBuffer == nullptr) {
-                BITCHAT_SERIAL.println("PARSE: malloc failed!");
-                if (decomp) free(decomp);
-                if (decompBuffer) free(decompBuffer);
-                return false;
-            }
-            BITCHAT_SERIAL.println("PARSE: malloc OK, initializing decompressor...");
-            BITCHAT_SERIAL.flush();
-
-            tinfl_init(decomp);
-
-            size_t inBytes = compressedLen;
-            size_t outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
-
-            // TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF is required for linear output buffer
-            // Without it, tinfl expects a ring buffer dictionary
-            const int linearBufFlag = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-
-            // Try raw deflate first (Android uses raw deflate, not zlib)
-            BITCHAT_SERIAL.println("PARSE: Calling tinfl_decompress (raw deflate)...");
-            BITCHAT_SERIAL.flush();
-            tinfl_status status = tinfl_decompress(
-                decomp,
-                compressedData,         // Input
-                &inBytes,               // Input size (updated)
-                decompBuffer,           // Output buffer start
-                decompBuffer,           // Output write position
-                &outBytes,              // Output size (updated)
-                linearBufFlag           // Linear buffer, raw deflate
-            );
-            BITCHAT_SERIAL.printf("PARSE: tinfl_decompress returned status=%d, outBytes=%u\n", status, (unsigned)outBytes);
-            BITCHAT_SERIAL.flush();
-
-            // If raw deflate failed, try with zlib header
-            if (status != TINFL_STATUS_DONE) {
-                BITCHAT_SERIAL.println("PARSE: Raw deflate failed, trying zlib...");
-                BITCHAT_SERIAL.flush();
-                tinfl_init(decomp);
-                inBytes = compressedLen;
-                outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
-                status = tinfl_decompress(
-                    decomp,
-                    compressedData,
-                    &inBytes,
-                    decompBuffer,
-                    decompBuffer,
-                    &outBytes,
-                    linearBufFlag | TINFL_FLAG_PARSE_ZLIB_HEADER
-                );
-                BITCHAT_SERIAL.printf("PARSE: zlib attempt returned status=%d\n", status);
-                BITCHAT_SERIAL.flush();
-            }
-
-            if (status != TINFL_STATUS_DONE) {
-                BITCHAT_SERIAL.printf("PARSE: Decompression failed with status=%d (expected %d)\n",
-                              status, TINFL_STATUS_DONE);
-                BITCHAT_SERIAL.flush();
-                free(decomp);
-                free(decompBuffer);
-                return false;
-            }
-            BITCHAT_SERIAL.printf("PARSE: Decompression SUCCESS, outBytes=%u\n", (unsigned)outBytes);
-            BITCHAT_SERIAL.flush();
-
-            // Bounds check: ensure decompressed data fits in payload buffer
-            if (outBytes > BITCHAT_MAX_PAYLOAD_SIZE) {
-                BITCHAT_SERIAL.printf("ERROR: Decompressed size %u exceeds buffer %u!\n",
-                              (unsigned)outBytes, (unsigned)BITCHAT_MAX_PAYLOAD_SIZE);
-                free(decomp);
-                free(decompBuffer);
-                return false;
-            }
-
-            // Copy decompressed data to message payload
-            size_t decompressedLen = outBytes;
-            memcpy(msg.payload, decompBuffer, decompressedLen);
-            free(decomp);
-            free(decompBuffer);
-
-            msg.payloadLength = static_cast<uint16_t>(decompressedLen);
-            msg.flags &= ~BITCHAT_FLAG_IS_COMPRESSED;  // Clear compressed flag
-#else
-            // Platforms without decompression support: just copy raw payload
-            memcpy(msg.payload, &data[offset], wirePayloadLength);
-#endif
+            int n = inflatePayload(&data[offset], payloadLen, msg.payload, sizeof(msg.payload), msg.version);
+            if (n < 0) return false;
+            msg.payloadLength = static_cast<uint16_t>(n);
+            msg.flags &= ~BITCHAT_FLAG_IS_COMPRESSED;
         } else {
-            // Uncompressed payload - direct copy
-            memcpy(msg.payload, &data[offset], wirePayloadLength);
+            if (payloadLen > sizeof(msg.payload)) return false;
+            memcpy(msg.payload, &data[offset], payloadLen);
         }
-        offset += wirePayloadLength;
+        offset += payloadLen;
     }
 
-    // Parse signature (if present)
     memset(msg.signature, 0, BITCHAT_SIGNATURE_SIZE);
     if (msg.hasSignature()) {
         memcpy(msg.signature, &data[offset], BITCHAT_SIGNATURE_SIZE);
-        offset += BITCHAT_SIGNATURE_SIZE;
     }
-
-    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: parseMessage SUCCESS type=0x%02X payloadLen=%u\n",
-                  msg.type, msg.payloadLength);
-    BITCHAT_SERIAL.flush();
     return true;
 }
 
 size_t BitchatProtocol::serializeMessage(const BitchatMessage& msg, uint8_t* buffer, size_t maxLength) {
-    // Required size must reflect the bytes we actually WRITE below, which use the
-    // (possibly decompressed) payloadLength - NOT getMessageSize(), which returns the
-    // compressed on-wire size and would under-count for decompressed messages, letting
-    // the writes below overflow the caller's buffer (stack-smash on long synced messages).
     size_t requiredSize = BITCHAT_HEADER_SIZE + BITCHAT_SENDER_ID_SIZE
                         + (msg.hasRecipient() ? BITCHAT_RECIPIENT_ID_SIZE : 0)
                         + msg.payloadLength
                         + (msg.hasSignature() ? BITCHAT_SIGNATURE_SIZE : 0);
-    if (maxLength < requiredSize) {
-        return 0;
-    }
+    if (maxLength < requiredSize) return 0;
 
     size_t offset = 0;
-
-    // Write header
-    buffer[offset++] = msg.version;
+    buffer[offset++] = BITCHAT_VERSION;  // always emit v1
     buffer[offset++] = msg.type;
     buffer[offset++] = msg.ttl;
     writeBE64(&buffer[offset], msg.timestamp);
     offset += 8;
-    buffer[offset++] = msg.flags;
+    buffer[offset++] = msg.flags & ~BITCHAT_FLAG_HAS_ROUTE;
     writeBE16(&buffer[offset], msg.payloadLength);
     offset += 2;
 
-    // Write sender ID
     memcpy(&buffer[offset], msg.senderId, BITCHAT_SENDER_ID_SIZE);
     offset += BITCHAT_SENDER_ID_SIZE;
 
-    // Write recipient ID (if present)
     if (msg.hasRecipient()) {
         memcpy(&buffer[offset], msg.recipientId, BITCHAT_RECIPIENT_ID_SIZE);
         offset += BITCHAT_RECIPIENT_ID_SIZE;
     }
 
-    // Write payload
     if (msg.payloadLength > 0) {
         memcpy(&buffer[offset], msg.payload, msg.payloadLength);
         offset += msg.payloadLength;
     }
 
-    // Write signature (if present)
     if (msg.hasSignature()) {
         memcpy(&buffer[offset], msg.signature, BITCHAT_SIGNATURE_SIZE);
         offset += BITCHAT_SIGNATURE_SIZE;
@@ -451,15 +334,8 @@ size_t BitchatProtocol::serializeMessage(const BitchatMessage& msg, uint8_t* buf
 }
 
 bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
-    BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage type=0x%02X\n", msg.type);
+    if (msg.version < 1 || msg.version > BITCHAT_VERSION_MAX) return false;
 
-    // Check version
-    if (msg.version != BITCHAT_VERSION) {
-        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - bad version %u\n", msg.version);
-        return false;
-    }
-
-    // Check type is valid
     switch (msg.type) {
         case BITCHAT_MSG_ANNOUNCE:
         case BITCHAT_MSG_MESSAGE:
@@ -475,101 +351,72 @@ bool BitchatProtocol::validateMessage(const BitchatMessage& msg) {
         case BITCHAT_MSG_FILE_TRANSFER:
         case BITCHAT_MSG_FRAGMENT:
             break;
-        case BITCHAT_MSG_VOICE_FRAME:
-        case BITCHAT_MSG_COURIER_ACK_A:
-        case BITCHAT_MSG_COURIER_ACK_B:
-        case BITCHAT_MSG_ANNOUNCE_V2:
-        case BITCHAT_MSG_VIDEO_FRAME:
-            // Known, but never bridged (live audio/video, reserved types): drop early
-            return false;
         default:
-            BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - unknown type 0x%02X\n", msg.type);
             return false;
     }
 
-    // Check payload length
-    if (msg.payloadLength > BITCHAT_MAX_PAYLOAD_SIZE) {
-        BITCHAT_SERIAL.printf("REDUNDANT_DEBUG: validateMessage FAIL - payloadLen %u > max\n", msg.payloadLength);
-        return false;
-    }
+    if (msg.payloadLength > BITCHAT_MAX_PAYLOAD_SIZE) return false;
 
-    // Check sender ID is non-zero
-    bool senderNonZero = false;
     for (int i = 0; i < BITCHAT_SENDER_ID_SIZE; i++) {
-        if (msg.senderId[i] != 0) {
-            senderNonZero = true;
-            break;
-        }
+        if (msg.senderId[i] != 0) return true;
     }
-    if (!senderNonZero) {
-        BITCHAT_SERIAL.println("REDUNDANT_DEBUG: validateMessage FAIL - zero sender ID");
-        return false;
-    }
-
-    BITCHAT_SERIAL.println("REDUNDANT_DEBUG: validateMessage SUCCESS");
-    return true;
+    return false;
 }
 
 size_t BitchatProtocol::getMessageSize(const BitchatMessage& msg) {
-    size_t size = BITCHAT_HEADER_SIZE + BITCHAT_SENDER_ID_SIZE;
-
-    if (msg.hasRecipient()) {
-        size += BITCHAT_RECIPIENT_ID_SIZE;
-    }
-
-    // Use wirePayloadLength for wire size calculation (important for compressed messages)
-    // After decompression, payloadLength has decompressed size but wirePayloadLength has original wire size
-    // NOTE: this returns the ON-WIRE size and is used to advance the parser; serializeMessage()
-    // computes its own required size from payloadLength (the bytes it actually writes).
+    size_t headerSize = (msg.version >= BITCHAT_VERSION_2) ? BITCHAT_HEADER_SIZE_V2 : BITCHAT_HEADER_SIZE;
+    size_t size = headerSize + BITCHAT_SENDER_ID_SIZE;
+    if (msg.hasRecipient()) size += BITCHAT_RECIPIENT_ID_SIZE;
     size += (msg.wirePayloadLength > 0) ? msg.wirePayloadLength : msg.payloadLength;
-
-    if (msg.hasSignature()) {
-        size += BITCHAT_SIGNATURE_SIZE;
-    }
-
+    if (msg.hasSignature()) size += BITCHAT_SIGNATURE_SIZE;
     return size;
 }
 
 void BitchatProtocol::computePacketId(const BitchatMessage& msg, uint8_t* outId16) {
-    // Compute packet ID matching Android Bitchat:
-    // SHA-256(type | senderId | timestamp_BE | payload)[0:16]
-    //
-    // This creates a deterministic unique ID for each message based on its content.
-    // Used by GCS filter to detect which messages the requester already has.
-
-    // Build the data to hash: type(1) + senderId(8) + timestamp(8 BE) + payload
-    // Static to avoid ~2KB stack allocation on NRF52
     static uint8_t hashInput[1 + BITCHAT_SENDER_ID_SIZE + 8 + BITCHAT_MAX_PAYLOAD_SIZE];
     size_t offset = 0;
 
-    // Type (1 byte)
     hashInput[offset++] = msg.type;
-
-    // Sender ID (8 bytes, as stored - little endian)
     memcpy(&hashInput[offset], msg.senderId, BITCHAT_SENDER_ID_SIZE);
     offset += BITCHAT_SENDER_ID_SIZE;
-
-    // Timestamp (8 bytes, big-endian)
     writeBE64(&hashInput[offset], msg.timestamp);
     offset += 8;
 
-    // Payload
-    if (msg.payloadLength > 0) {
-        memcpy(&hashInput[offset], msg.payload, msg.payloadLength);
-        offset += msg.payloadLength;
+    size_t payLen = msg.payloadLength <= BITCHAT_MAX_PAYLOAD_SIZE ? msg.payloadLength : BITCHAT_MAX_PAYLOAD_SIZE;
+    if (payLen > 0) {
+        memcpy(&hashInput[offset], msg.payload, payLen);
+        offset += payLen;
     }
 
-    // Compute SHA-256 and truncate to 16 bytes
     uint8_t fullHash[32];
     mesh::Utils::sha256(fullHash, 32, hashInput, static_cast<int>(offset));
-
-    // Copy first 16 bytes as the packet ID
     memcpy(outId16, fullHash, 16);
 }
 
-// ============================================================================
-// BitchatProtocol - Message Creation
-// ============================================================================
+size_t BitchatProtocol::applyPKCS7Padding(uint8_t* buffer, size_t dataLen, size_t capacity) {
+    static const size_t blockSizes[] = {256, 512, 1024, 2048};
+    size_t targetSize = dataLen;
+    for (size_t i = 0; i < 4; i++) {
+        if (dataLen + 16 <= blockSizes[i]) {
+            targetSize = blockSizes[i];
+            break;
+        }
+    }
+    if (dataLen >= targetSize || targetSize > capacity) return dataLen;
+    size_t paddingNeeded = targetSize - dataLen;
+    if (paddingNeeded > 255) return dataLen;
+    memset(buffer + dataLen, static_cast<int>(paddingNeeded), paddingNeeded);
+    return targetSize;
+}
+
+size_t BitchatProtocol::signingPreimage(const BitchatMessage& msg, uint8_t* buffer, size_t maxLength) {
+    size_t len = serializeMessage(msg, buffer, maxLength);
+    if (len == 0) return 0;
+    if (msg.hasSignature()) len -= BITCHAT_SIGNATURE_SIZE;
+    buffer[2] = 0;  // TTL = SYNC_TTL_HOPS
+    buffer[11] &= ~(BITCHAT_FLAG_HAS_SIGNATURE | BITCHAT_FLAG_IS_RSR);
+    return applyPKCS7Padding(buffer, len, maxLength);
+}
 
 void BitchatProtocol::createAnnounce(BitchatMessage& msg, uint64_t senderId, const char* nickname,
                                      const uint8_t* noisePublicKey, const uint8_t* signingPublicKey,
@@ -578,244 +425,47 @@ void BitchatProtocol::createAnnounce(BitchatMessage& msg, uint64_t senderId, con
     msg.type = BITCHAT_MSG_ANNOUNCE;
     msg.ttl = ttl;
     msg.timestamp = timestamp;
-    msg.flags = 0;  // No recipient, no signature for basic announce
+    msg.flags = 0;
     msg.setSenderId64(senderId);
+    memset(msg.recipientId, 0, sizeof(msg.recipientId));
 
-    // Build TLV payload
     size_t offset = 0;
-
-    // Add nickname TLV (0x01)
-    // NOTE: Nickname is limited to 13 bytes to ensure signed announce packet fits within
-    // BLE MTU of 169 bytes. Total: header(13) + sender(8) + payload(84 max) + sig(64) = 169
-    // Payload: nick_tlv(2+13=15) + noise_tlv(34) + ed25519_tlv(34) = 83 bytes
     if (nickname != nullptr && nickname[0] != '\0') {
         size_t nickLen = strlen(nickname);
-        if (nickLen > 13) nickLen = 13;  // Limit to ensure packet fits in 169-byte MTU
-
-        if (offset + 2 + nickLen <= BITCHAT_MAX_PAYLOAD_SIZE) {
-            msg.payload[offset++] = BITCHAT_TLV_NICKNAME;
-            msg.payload[offset++] = static_cast<uint8_t>(nickLen);
-            memcpy(&msg.payload[offset], nickname, nickLen);
-            offset += nickLen;
-        }
+        if (nickLen > 13) nickLen = 13;
+        msg.payload[offset++] = BITCHAT_TLV_NICKNAME;
+        msg.payload[offset++] = static_cast<uint8_t>(nickLen);
+        memcpy(&msg.payload[offset], nickname, nickLen);
+        offset += nickLen;
     }
-
-    // Add Noise public key TLV (0x02) - Curve25519 for Noise protocol
     if (noisePublicKey != nullptr) {
-        if (offset + 2 + 32 <= BITCHAT_MAX_PAYLOAD_SIZE) {
-            msg.payload[offset++] = BITCHAT_TLV_NOISE_PUBKEY;
-            msg.payload[offset++] = 32;
-            memcpy(&msg.payload[offset], noisePublicKey, 32);
-            offset += 32;
-        }
+        msg.payload[offset++] = BITCHAT_TLV_NOISE_PUBKEY;
+        msg.payload[offset++] = 32;
+        memcpy(&msg.payload[offset], noisePublicKey, 32);
+        offset += 32;
     }
-
-    // Add Ed25519 signing public key TLV (0x03)
     if (signingPublicKey != nullptr) {
-        if (offset + 2 + 32 <= BITCHAT_MAX_PAYLOAD_SIZE) {
-            msg.payload[offset++] = BITCHAT_TLV_ED25519_PUBKEY;
-            msg.payload[offset++] = 32;
-            memcpy(&msg.payload[offset], signingPublicKey, 32);
-            offset += 32;
-        }
+        msg.payload[offset++] = BITCHAT_TLV_ED25519_PUBKEY;
+        msg.payload[offset++] = 32;
+        memcpy(&msg.payload[offset], signingPublicKey, 32);
+        offset += 32;
     }
-
     msg.payloadLength = static_cast<uint16_t>(offset);
+    msg.wirePayloadLength = msg.payloadLength;
 }
 
-void BitchatProtocol::createTextMessage(BitchatMessage& msg, uint64_t senderId, uint64_t recipientId,
-                                        const char* channelName, const char* text, size_t textLen,
-                                        uint64_t timestamp, uint8_t ttl) {
-    msg.version = BITCHAT_VERSION;
-    msg.type = BITCHAT_MSG_MESSAGE;
-    msg.ttl = ttl;
-    msg.timestamp = timestamp;
-    msg.setSenderId64(senderId);
-
-    size_t offset = 0;
-
-    if (recipientId != 0) {
-        // Direct message
-        msg.flags = BITCHAT_FLAG_HAS_RECIPIENT;
-        msg.setRecipientId64(recipientId);
-
-        // Payload is just the text
-        if (textLen > BITCHAT_MAX_PAYLOAD_SIZE) {
-            textLen = BITCHAT_MAX_PAYLOAD_SIZE;
+const uint8_t* BitchatProtocol::findTLV(const uint8_t* payload, size_t len, uint8_t type, uint8_t* outLen) {
+    size_t off = 0;
+    while (off + 2 <= len) {
+        uint8_t t = payload[off];
+        uint8_t l = payload[off + 1];
+        off += 2;
+        if (off + l > len) return nullptr;
+        if (t == type) {
+            *outLen = l;
+            return &payload[off];
         }
-        memcpy(msg.payload, text, textLen);
-        offset = textLen;
-    } else if (channelName != nullptr && channelName[0] != '\0') {
-        // Channel message - format: "#channel:text"
-        msg.flags = 0;  // No recipient
-        memset(msg.recipientId, 0, BITCHAT_RECIPIENT_ID_SIZE);
-
-        // Build payload: #channelname\0text
-        size_t channelLen = strlen(channelName);
-
-        // Add # prefix and channel name
-        if (offset < BITCHAT_MAX_PAYLOAD_SIZE) {
-            msg.payload[offset++] = '#';
-        }
-        for (size_t i = 0; i < channelLen && offset < BITCHAT_MAX_PAYLOAD_SIZE; i++) {
-            msg.payload[offset++] = channelName[i];
-        }
-
-        // Add separator (colon)
-        if (offset < BITCHAT_MAX_PAYLOAD_SIZE) {
-            msg.payload[offset++] = ':';
-        }
-
-        // Add text
-        for (size_t i = 0; i < textLen && offset < BITCHAT_MAX_PAYLOAD_SIZE; i++) {
-            msg.payload[offset++] = text[i];
-        }
-    } else {
-        // No recipient and no channel - invalid, but handle gracefully
-        msg.flags = 0;
-        memset(msg.recipientId, 0, BITCHAT_RECIPIENT_ID_SIZE);
-        if (textLen > BITCHAT_MAX_PAYLOAD_SIZE) {
-            textLen = BITCHAT_MAX_PAYLOAD_SIZE;
-        }
-        memcpy(msg.payload, text, textLen);
-        offset = textLen;
+        off += l;
     }
-
-    msg.payloadLength = static_cast<uint16_t>(offset);
-}
-
-// ============================================================================
-// BitchatProtocol - Decompression Helper
-// ============================================================================
-
-bool BitchatProtocol::decompressPayload(BitchatMessage& msg) {
-    // If not compressed, nothing to do
-    if (!msg.isCompressed()) {
-        return true;
-    }
-
-#if BITCHAT_HAS_DECOMPRESSION
-    BITCHAT_SERIAL.println("DECOMPRESS: Compressed payload detected");
-    BITCHAT_SERIAL.flush();
-
-    // Compressed payload format (from Android CompressionUtil.kt):
-    // - First 2 bytes: original uncompressed size (big-endian)
-    // - Remaining bytes: raw deflate compressed data
-    if (msg.payloadLength < 3) {
-        BITCHAT_SERIAL.println("DECOMPRESS: Payload too short");
-        return false;
-    }
-
-    // Read original size from first 2 bytes
-    uint16_t originalSize = (msg.payload[0] << 8) | msg.payload[1];
-    const uint8_t* compressedData = &msg.payload[2];
-    size_t compressedLen = msg.payloadLength - 2;
-
-    BITCHAT_SERIAL.printf("DECOMPRESS: originalSize=%u, compressedLen=%u\n", originalSize, (unsigned)compressedLen);
-    BITCHAT_SERIAL.flush();
-
-    if (originalSize > BITCHAT_MAX_PAYLOAD_SIZE) {
-        BITCHAT_SERIAL.printf("DECOMPRESS: originalSize %u > max %u, rejecting\n", originalSize, BITCHAT_MAX_PAYLOAD_SIZE);
-        return false;
-    }
-
-#if defined(NRF52_PLATFORM)
-    // Use static buffers from BitchatBridge to avoid heap fragmentation
-    tinfl_decompressor* decomp = BitchatBridge::getDecompressor();
-    uint8_t* decompBuffer = BitchatBridge::getDecompBuffer();
-
-    if (decomp == nullptr || decompBuffer == nullptr) {
-        BITCHAT_SERIAL.println("DECOMPRESS: Static buffers not available!");
-        return false;
-    }
-#else
-    // ESP32: Use heap allocation (has more RAM and uses ROM miniz)
-    tinfl_decompressor* decomp = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
-    uint8_t* decompBuffer = (uint8_t*)malloc(BITCHAT_MAX_PAYLOAD_SIZE);
-
-    if (decomp == nullptr || decompBuffer == nullptr) {
-        BITCHAT_SERIAL.println("DECOMPRESS: malloc failed!");
-        if (decomp) free(decomp);
-        if (decompBuffer) free(decompBuffer);
-        return false;
-    }
-#endif
-
-    tinfl_init(decomp);
-
-    size_t inBytes = compressedLen;
-    size_t outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
-
-    // TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF is required for linear output buffer
-    const int linearBufFlag = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-
-    // Try raw deflate first (Android uses raw deflate, not zlib)
-    BITCHAT_SERIAL.println("DECOMPRESS: Trying raw deflate...");
-    BITCHAT_SERIAL.flush();
-    tinfl_status status = tinfl_decompress(
-        decomp,
-        compressedData,
-        &inBytes,
-        decompBuffer,
-        decompBuffer,
-        &outBytes,
-        linearBufFlag
-    );
-
-    // If raw deflate failed, try with zlib header
-    if (status != TINFL_STATUS_DONE) {
-        BITCHAT_SERIAL.println("DECOMPRESS: Raw deflate failed, trying zlib...");
-        BITCHAT_SERIAL.flush();
-        tinfl_init(decomp);
-        inBytes = compressedLen;
-        outBytes = BITCHAT_MAX_PAYLOAD_SIZE;
-        status = tinfl_decompress(
-            decomp,
-            compressedData,
-            &inBytes,
-            decompBuffer,
-            decompBuffer,
-            &outBytes,
-            linearBufFlag | TINFL_FLAG_PARSE_ZLIB_HEADER
-        );
-    }
-
-    if (status != TINFL_STATUS_DONE) {
-        BITCHAT_SERIAL.println("DECOMPRESS: Decompression failed");
-#if !defined(NRF52_PLATFORM)
-        free(decomp);
-        free(decompBuffer);
-#endif
-        return false;
-    }
-
-    BITCHAT_SERIAL.printf("DECOMPRESS: Success, outBytes=%u\n", (unsigned)outBytes);
-    BITCHAT_SERIAL.flush();
-
-    // Bounds check
-    if (outBytes > BITCHAT_MAX_PAYLOAD_SIZE) {
-        BITCHAT_SERIAL.printf("DECOMPRESS: Decompressed size %u exceeds buffer!\n", (unsigned)outBytes);
-#if !defined(NRF52_PLATFORM)
-        free(decomp);
-        free(decompBuffer);
-#endif
-        return false;
-    }
-
-    // Copy decompressed data back to message payload
-    memcpy(msg.payload, decompBuffer, outBytes);
-    msg.payloadLength = static_cast<uint16_t>(outBytes);
-    msg.flags &= ~BITCHAT_FLAG_IS_COMPRESSED;  // Clear compressed flag
-
-#if !defined(NRF52_PLATFORM)
-    free(decomp);
-    free(decompBuffer);
-#endif
-
-    return true;
-#else
-    // No decompression support - just clear the flag and hope for the best
-    msg.flags &= ~BITCHAT_FLAG_IS_COMPRESSED;
-    return true;
-#endif
+    return nullptr;
 }

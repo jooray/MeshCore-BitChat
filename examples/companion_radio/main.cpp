@@ -1,4 +1,5 @@
 #include <Arduino.h>   // needed for PlatformIO
+#include <new>
 #include <Mesh.h>
 #include "MyMesh.h"
 #include <helpers/bitchat/BitchatDebugSerial.h>  // BITCHAT_SERIAL: silent unless BITCHAT_DEBUG_SERIAL=1
@@ -361,11 +362,14 @@ void setup() {
 
 // add bitchat bridge, must be after the bluetooth interface has been started
 #if defined(ENABLE_BITCHAT) && (defined(ESP32) || defined(NRF52_PLATFORM))
-  bitchat_bridge = new BitchatBridge(the_mesh, the_mesh.self_id, the_mesh.getNodeName(),
-                                    the_mesh.getNodePrefs()->path_hash_mode,
-                                    the_mesh.getNodePrefs()->bitchat_region);  if (bitchat_bridge == nullptr) {
-    BITCHAT_SERIAL.println("ERROR: BitchatBridge allocation failed!");
-  } else {
+  // Static storage avoids ~2 KB heap allocation/fragmentation on nRF52 and ESP32
+  alignas(BitchatBridge) static uint8_t bitchat_bridge_storage[sizeof(BitchatBridge)];
+  bitchat_bridge = new (bitchat_bridge_storage) BitchatBridge(
+      the_mesh, the_mesh.self_id, the_mesh.getNodeName(),
+      the_mesh.getNodePrefs()->path_hash_mode,
+      the_mesh.getNodePrefs()->bitchat_region,
+      the_mesh.getNodePrefs()->default_scope_key);
+  {
     bitchat_bridge->begin();
   #if defined(BLE_PIN_CODE) && defined(ESP32)
     // share the BLE server with the MeshCore companion interface

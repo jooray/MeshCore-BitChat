@@ -8,11 +8,11 @@ The Bitchat Bridge enables communication between the [Bitchat](https://bitchat.a
 - **Channel**: Only the `#mesh` channel is bridged (hardcoded)
 - **MeshCore region**: optional, via the persistent `bitchat_region` setting. Unset by default, which floods unscoped as before
 - **Identification**: Messages from Bitchat users appear with a phone emoji prefix on MeshCore nodes
-- **Platforms**: ESP32 (full support) and NRF52 (limited - short messages only)
+- **Platforms**: ESP32 and NRF52 (both with full protocol and decompression support)
 
 ## Supported Boards
 
-### ESP32-based (19 targets) - Full Support
+### ESP32-based (19 targets)
 
 ESP32 boards support long/compressed messages via ROM-based miniz decompression.
 
@@ -37,9 +37,9 @@ ESP32 boards support long/compressed messages via ROM-based miniz decompression.
 | ThinkNode M2 | `ThinkNode_M2_companion_radio_usb_bitchat` | ESP32-S3 | |
 | ThinkNode M5 | `ThinkNode_M5_companion_radio_usb_bitchat` | ESP32-S3 | |
 
-### NRF52-based (18 targets) - Limited Support
+### NRF52-based (19 targets)
 
-NRF52 boards do **not** support long/compressed messages due to heap constraints (SoftDevice BLE reserves significant memory). Short messages (<256 bytes uncompressed) work fine.
+NRF52 boards support long/compressed messages using statically allocated `miniz_tinfl` buffers (zero dynamic heap allocation in the packet path).
 
 | Board | Target | Tested |
 |-------|--------|--------|
@@ -67,10 +67,8 @@ NRF52 boards do **not** support long/compressed messages due to heap constraints
 
 | Platform | Long Messages | Reason |
 |----------|---------------|--------|
-| ESP32/S3/C3 | ✓ Yes | ROM-based miniz (no heap usage) |
-| NRF52 | ✗ No | Heap too small for miniz + SoftDevice BLE |
-
-**Recommendation**: Use ESP32-based boards for full Bitchat functionality.
+| ESP32/S3/C3 | ✓ Yes | ROM-based miniz |
+| NRF52 | ✓ Yes | Static `miniz_tinfl` inflater (no heap usage) |
 
 ## Build Targets
 
@@ -103,7 +101,7 @@ Set the bridge's persistent region scope with the MeshCore CLI. The leading `#` 
 meshcli -s /dev/ttyACM0 set bitchat_region slc
 ```
 
-The bridge uses this region for BitChat-to-MeshCore transmissions. Leave it empty to keep the previous unscoped behaviour — setting it to a region your repeaters do not share will stop the packets propagating.
+The bridge uses this region for BitChat-to-MeshCore transmissions. Leave it empty to inherit the companion's default flood scope (if configured in the MeshCore app) or flood unscoped — setting it to a region your repeaters do not share will stop the packets propagating.
 
 
 ## Troubleshooting
@@ -176,7 +174,7 @@ MeshCore packets have a ~127-byte payload limit. Long Bitchat messages are autom
 
 5. **Time synchronization**: The bridge takes its clock from Bitchat announces it hears directly (see "Timestamps" below). If its RTC is wrong and no Bitchat phone is nearby, its announces are rejected. Time needs to be accurate for Bitchat to work.
 
-6. **NRF52 long message limitation**: NRF52 devices cannot decompress long/compressed Bitchat messages due to heap constraints. Messages >256 bytes (before compression) may fail on NRF52.
+6. **Automatic `#mesh` channel**: The bridge automatically decrypts and bridges `#mesh` even if the channel was not manually added in the MeshCore companion app.
 
 ### Can I run this is a MeshCore repeater?
 
@@ -242,10 +240,10 @@ This matches MeshCore's hashtag room key derivation.
 
 ### Protocol Support
 
-- Message decompression (zlib via ESP32 ROM miniz, ESP32 only)
+- Message decompression (zlib/raw-deflate via ESP32 ROM miniz or static `miniz_tinfl` on NRF52; handles both v1 2-byte and v2 4-byte original-size prefixes)
 - Ed25519 message signing
-- Peer announcement/discovery
-- REQUEST_SYNC handling (sends cached messages with TTL 0, like the apps)
+- Peer announcement/discovery and `LEAVE` cache eviction
+- REQUEST_SYNC handling with Golomb-Coded Set (GCS) filtering and `sinceTimestamp` support (replays exact cached wire bytes with TTL 0)
 - Fragment reassembly for long messages
 
 ### Bitchat Protocol Baseline

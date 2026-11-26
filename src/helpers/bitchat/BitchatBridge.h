@@ -47,7 +47,8 @@ public:
      * @param nodeName This node's display name
      */
     BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, const char* nodeName,
-                  const uint8_t& pathHashMode, const char* regionName = nullptr);
+                  const uint8_t& pathHashMode, const char* regionName = nullptr,
+                  const uint8_t* defaultScopeKey = nullptr);
     /**
      * Initialize the bridge
      * Call after mesh.begin()
@@ -122,6 +123,7 @@ public:
      * Get this node's Bitchat peer ID (derived from identity)
      */
     uint64_t getBitchatPeerId() const { return _bitchatPeerId; }
+    const mesh::GroupChannel& getMeshChannel() const { return _meshChannel; }
 
     /**
      * Register a channel mapping between Bitchat channel name and MeshCore GroupChannel
@@ -179,9 +181,10 @@ public:
 protected:
 #if defined(ESP32) || defined(NRF52_PLATFORM)
     // BitchatBLECallback implementation
-    void onBitchatMessageReceived(const BitchatMessage& msg) override;
+    void onBitchatRawPacket(const uint8_t* data, size_t len) override;
     void onBitchatClientConnect() override;
     void onBitchatClientDisconnect() override;
+    void onBitchatClientSubscribed() override;
 #endif
 
 private:
@@ -190,6 +193,7 @@ private:
     const char* _nodeName;
     const uint8_t& _pathHashMode;
     const char* _regionName;
+    const uint8_t* _defaultScopeKey;
 #if defined(ESP32) || defined(NRF52_PLATFORM)
     BitchatBLEService _bleService;
 #endif
@@ -226,18 +230,24 @@ private:
     static const uint32_t ANNOUNCE_INTERVAL_MS = 4000;  // 4 seconds when no client connected
     static const uint32_t ANNOUNCE_INTERVAL_CONNECTED_MS = 15000;  // 15 seconds when client connected
 
-    // Fragment reassembly deferred processing (to avoid re-entrant call chains)
-    // Static to keep ~1.1KB out of heap allocation
-    static BitchatMessage _reassembledMsg;  // Buffer for reassembled message awaiting processing
-    bool _hasReassembledMsg;         // True when _reassembledMsg contains a message to process
+    // Fragment reassembly deferred processing (raw bytes parsed in loop())
+    static const size_t REASSEMBLY_BUFFER_SIZE = BITCHAT_MAX_PAYLOAD_SIZE + 128;
+    static uint8_t _reassembledRaw[REASSEMBLY_BUFFER_SIZE];
+    size_t _reassembledRawLen;
+    bool _hasReassembledMsg;
 
     // Time synchronization from directly received Bitchat ANNOUNCEs (see BitchatTimeSync.h)
-    int64_t _timeOffset;      // Offset to add to millis() to get Unix time (ms)
+    int64_t _timeOffset;      // Offset to add to uptimeMs() to get Unix time (ms)
+    uint32_t _lastMillis32;   // For 64-bit wraparound-safe uptimeMs()
+    uint64_t _millisHigh;
     bool _timeSynced;         // True once the clock was taken from a Bitchat announce
     bool _timeSyncVerified;   // True if that announce had a verified signature
     bool _rtcSetByBridge;     // RTC was implausible and the bridge set it, so it may correct it
     uint64_t _bootTimestamp;  // Unix timestamp (ms) when time was first synced (used to filter old messages)
+    uint64_t _lastTxTimestamp;
     BitchatTimeSyncPolicy _timePolicy;
+
+    uint64_t uptimeMs();
 
     // Statistics
     uint32_t _messagesRelayed;
@@ -252,71 +262,39 @@ private:
     bool _meshChannelConfigured;            // True if #mesh channel is found/configured
     int _meshChannelIndex;                  // Index in the mesh's channel array (-1 if not found)
 
-    // Message history cache for REQUEST_SYNC
-    // Stores recent messages so we can respond to sync requests
+    // Message history cache for REQUEST_SYNC (raw wire bytes preserve compressed/v2 signatures)
+    static const size_t HISTORY_SLOT_SIZE = 256;
     struct CachedMessage {
-        BitchatMessage msg;
-        uint32_t addedTimeMs;  // millis() when message was cached (for expiration)
-        bool valid;
+        uint8_t packetId[16];
+        uint64_t timestamp;
+        uint32_t addedTimeMs;
+        uint16_t len;
+        uint8_t wire[HISTORY_SLOT_SIZE];
     };
     static const size_t MESSAGE_HISTORY_SIZE = 8;
     static const uint32_t MESSAGE_EXPIRY_MS = 300000;  // 5 minutes
-    // Static to keep ~17KB out of heap allocation (8 * ~2KB BitchatMessage)
     static CachedMessage _messageHistory[MESSAGE_HISTORY_SIZE];
     size_t _messageHistoryHead;
 
     /**
-     * Golomb-Coded Set (GCS) filter for REQUEST_SYNC
-     * Used to determine which messages the requester already has.
-     * See Android RequestSyncPacket.kt for format details.
+     * Golomb-Coded Set (GCS) filter for REQUEST_SYNC (Android RequestSyncPacket.kt / iOS RequestSyncPacket.swift)
      */
     struct GCSFilter {
-        uint8_t p;           // Golomb-Rice parameter (bits for remainder)
-        uint32_t n;          // Number of elements in filter
-        uint32_t m;          // Range M = N * 2^P
-        const uint8_t* data; // Pointer to encoded bitstream
-        size_t dataLen;      // Length of encoded data
+        uint8_t p;
+        uint32_t m;
+        const uint8_t* data;
+        size_t dataLen;
+        uint64_t sinceTimestamp;
+        bool hasSince;
 
-        /**
-         * Check if a packet ID might be in the filter (probabilistic)
-         * @param packetId16 16-byte packet ID
-         * @return true if the ID might be in the filter (requester may have it)
-         */
         bool mightContain(const uint8_t* packetId16) const;
     };
 
-    /**
-     * Parse GCS filter from REQUEST_SYNC payload
-     * @param payload REQUEST_SYNC payload (TLV encoded)
-     * @param len Payload length
-     * @param outFilter Output filter structure
-     * @return true if filter was successfully parsed
-     */
-    bool parseGCSFilter(const uint8_t* payload, size_t len, GCSFilter& outFilter);
+    static bool parseGCSFilter(const uint8_t* payload, size_t len, GCSFilter& outFilter);
 
-    /**
-     * Find or configure the #mesh channel
-     * Called during begin() to set up the channel for relaying
-     */
     void configureMeshChannel();
-
-    /**
-     * Check if a MeshCore channel matches the #mesh channel by key
-     * @param channel Channel to check
-     * @return true if it's the #mesh channel
-     */
     bool isMeshChannel(const mesh::GroupChannel& channel) const;
-
-    /**
-     * Add a message to the history cache
-     * @param msg Message to cache
-     */
-    void addToMessageHistory(const BitchatMessage& msg);
-
-    /**
-     * Handle REQUEST_SYNC by sending cached messages
-     * @param msg The REQUEST_SYNC message
-     */
+    void addToMessageHistory(const BitchatMessage& msg, const uint8_t* raw, size_t rawLen);
     void handleRequestSync(const BitchatMessage& msg);
 
     // Peer nickname cache (populated from ANNOUNCE messages)
@@ -343,22 +321,23 @@ private:
         uint16_t totalFragments;    // Changed from uint8_t
         uint16_t receivedCount;     // Track received count
         uint8_t originalType;       // Store original message type
-        uint8_t receivedMask;       // Bitmask of received fragments (up to 16 fragments with extension)
-        uint8_t data[2048];         // Reassembly buffer
+        uint16_t receivedMask;      // Bitmask of received fragments (up to 16 fragments)
+        uint8_t data[REASSEMBLY_BUFFER_SIZE];
         size_t dataLen;
         uint32_t startTime;         // millis() when first fragment received
         bool active;
     };
-    static const size_t MAX_FRAGMENT_BUFFERS = 4;  // Reduced from 16 to save memory
+#if defined(NRF52_PLATFORM)
+    static const size_t MAX_FRAGMENT_BUFFERS = 2;
+#else
+    static const size_t MAX_FRAGMENT_BUFFERS = 4;
+#endif
     static const uint32_t FRAGMENT_TIMEOUT_MS = 10000;  // 10 second timeout
-    // Static to keep ~8KB out of heap (4 * ~2KB each)
     static FragmentBuffer _fragmentBuffers[MAX_FRAGMENT_BUFFERS];
 
-    /**
-     * Handle incoming fragment message
-     * Reassembles multi-fragment messages and processes when complete
-     */
     void handleFragment(const BitchatMessage& msg);
+    void processReassembled();
+    void evictPeer(uint64_t peerId);
 
     /**
      * Derive Bitchat peer ID from Meshcore identity
@@ -388,7 +367,7 @@ private:
     /**
      * Process incoming Bitchat message from BLE
      */
-    void processBitchatMessage(const BitchatMessage& msg);
+    void processBitchatMessage(const BitchatMessage& msg, const uint8_t* raw, size_t rawLen);
 
     /**
      * Relay Bitchat channel message to Meshcore mesh (with random delay for multi-bridge dedup)
